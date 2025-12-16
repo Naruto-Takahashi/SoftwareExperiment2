@@ -7,7 +7,7 @@
 #define NULLTASKID     0       /* キューの終端 */
 #define NUMTASK        5       /* 最大タスク数 */
 #define NUMSEMAPHORE   3       /* セマフォの数*/
-#define STKSIZE        1024    /* スタックサイズ (1KB) */
+#define STKSIZE        4096    /* スタックサイズ (5KB) */
 
 /* タスクの状態 (status) 用の定数例 */
 #define UNDEFINED      0       /* 未定義 */
