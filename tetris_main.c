@@ -8,6 +8,14 @@
 #include "mtk_c.h"
 
 /* -------------------------------------------------------------------
+ * ファイルポインタの参照 (extern)
+ * ------------------------------------------------------------------- */
+extern FILE *com0in;
+extern FILE *com0out;
+extern FILE *com1in;
+extern FILE *com1out;
+
+/* -------------------------------------------------------------------
  * 外部関数の宣言
  * ------------------------------------------------------------------- */
 extern void init_kernel(void);
@@ -43,15 +51,27 @@ extern void skipmt(void);       /* CPU譲渡 */
 #define COL_WALL     "\x1b[37m"     /* 壁: 白 */
 
 /* -------------------------------------------------------------------
+ * ゲーム状態を管理する構造体の定義
+ * ------------------------------------------------------------------- */
+typedef struct {
+    int port_id;            /* 0 or 1 */
+    FILE *fp_out;           /* 出力用ファイルポインタ */
+    
+    char field[FIELD_HEIGHT][FIELD_WIDTH];
+    char displayBuffer[FIELD_HEIGHT][FIELD_WIDTH];
+    
+    int minoType;
+    int minoAngle;
+    int minoX;
+    int minoY;
+    
+    unsigned long next_drop_time;
+    unsigned int random_seed; /* 乱数シードも個別に持つ */
+} TetrisGame;
+
+/* -------------------------------------------------------------------
  * グローバル変数
  * ------------------------------------------------------------------- */
-/* * fieldの値の意味:
- * 0: 空白
- * 1: 壁
- * 2〜8: 固定されたミノの色ID (ミノタイプ + 2) 
- */
-char field[FIELD_HEIGHT][FIELD_WIDTH];
-char displayBuffer[FIELD_HEIGHT][FIELD_WIDTH];
 
 /* ミノの定義 */
 enum {
@@ -277,197 +297,213 @@ char minoShapes[MINO_TYPE_MAX][MINO_ANGLE_MAX][MINO_HEIGHT][MINO_WIDTH] = {
     }
 };
 
-int minoType = 0, minoAngle = 0;
-int minoX = 5, minoY = 0;
-
 /* -------------------------------------------------------------------
  * 関数群
  * ------------------------------------------------------------------- */
 
 /* 画面描画 */
-void display() {
+void display(TetrisGame *game) {
     int i, j;
     char cellVal;
 
-    /* 表示バッファ作成 (現在のフィールド状態をコピー) */
-    memcpy(displayBuffer, field, sizeof(field));
+    /* フィールドをバッファにコピー */
+    memcpy(game->displayBuffer, game->field, sizeof(game->field));
 
-    /* 操作中のミノを表示バッファに書き込む */
-    /* ここでは 2 + minoType を書き込む (2〜8) */
+    /* ミノをバッファに書き込み */
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
-            if (minoShapes[minoType][minoAngle][i][j]) {
-                displayBuffer[minoY + i][minoX + j] = 2 + minoType;
+            if (minoShapes[game->minoType][game->minoAngle][i][j]) {
+                game->displayBuffer[game->minoY + i][game->minoX + j] = 2 + game->minoType;
             }
         }
     }
 
-    /* カーソルを左上に戻す */
-    printf(ESC_HOME);
+    /* カーソルを左上に戻す (fprintfを使用) */
+    fprintf(game->fp_out, ESC_HOME);
 
     /* 描画ループ */
     for (i = 0; i < FIELD_HEIGHT; i++) {
         for (j = 0; j < FIELD_WIDTH; j++) {
-            cellVal = displayBuffer[i][j];
-
+            cellVal = game->displayBuffer[i][j];
+            
+            /* 出力はすべて game->fp_out に対して行う */
             if (cellVal == 0) {
-                printf(" ."); /* 空白 */
+                fprintf(game->fp_out, " .");
             } else if (cellVal == 1) {
-                /* 壁 (白) */
-                printf("%s[]%s", COL_WALL, ESC_RESET);
+                fprintf(game->fp_out, "%s[]%s", COL_WALL, ESC_RESET);
             } else if (cellVal >= 2 && cellVal <= 8) {
-                /* ミノ (種類に応じた色) */
-                /* cellVal - 2 が minoType (0〜6) に対応 */
-                printf("%s[]%s", minoColors[cellVal - 2], ESC_RESET);
+                fprintf(game->fp_out, "%s[]%s", minoColors[cellVal - 2], ESC_RESET);
             } else {
-                printf("??"); /* エラー */
+                fprintf(game->fp_out, "??");
             }
         }
-        printf("\n");
+        fprintf(game->fp_out, "\n");
     }
+    
+    /* バッファをフラッシュして即時表示させる */
+    fflush(game->fp_out);
 }
 
-/* 当たり判定 */
-int isHit(int _minoX, int _minoY, int _minoType, int _minoAngle) {
+/* 当たり判定 (構造体対応版) */
+int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngle) {
     int i, j;
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
             if (minoShapes[_minoType][_minoAngle][i][j] &&
-                field[_minoY + i][_minoX + j]) {
-                return 1; /* Hit (壁または固定済みブロックに衝突) */
+                game->field[_minoY + i][_minoX + j]) {
+                return 1; 
             }
         }
     }
-    return 0; /* No Hit */
+    return 0;
 }
 
-/* ミノのリセット */
-void resetMino() {
-    minoX = 5;
-    minoY = 0;
-    minoType = (tick + rand()) % MINO_TYPE_MAX;
-    minoAngle = (tick + rand()) % MINO_ANGLE_MAX;
+/* ミノのリセット (構造体対応版) */
+void resetMino(TetrisGame *game) {
+    game->minoX = 5;
+    game->minoY = 0;
+    /* 個別のシードを使って乱数生成 (簡易的な線形合同法などを使うか，rand() + tick) */
+    game->minoType = (tick + rand()) % MINO_TYPE_MAX; 
+    game->minoAngle = (tick + rand()) % MINO_ANGLE_MAX;
 }
 
 /* -------------------------------------------------------------------
- * ゲームタスク
+ * 汎用ゲームロジック
  * ------------------------------------------------------------------- */
-void game_task(void) {
-    unsigned long next_drop_time;
+void run_tetris(TetrisGame *game) {
     int c;
     int i, j;
 
     /* 初期化 */
-    printf(ESC_CLS);      /* 画面クリア */
-    printf(ESC_HIDE_CUR); /* カーソル非表示 */
+    fprintf(game->fp_out, ESC_CLS);      
+    fprintf(game->fp_out, ESC_HIDE_CUR); 
     
-    memset(field, 0, sizeof(field));
+    memset(game->field, 0, sizeof(game->field));
     
-    /* 壁(1)と床(1)の作成 */
+    /* 壁と床の作成 */
     for (i = 0; i < FIELD_HEIGHT; i++) {
-        field[i][0] = field[i][FIELD_WIDTH - 1] = 1;
+        game->field[i][0] = game->field[i][FIELD_WIDTH - 1] = 1;
     }
     for (i = 0; i < FIELD_WIDTH; i++) {
-        field[FIELD_HEIGHT - 1][i] = 1;
+        game->field[FIELD_HEIGHT - 1][i] = 1;
     }
 
-    resetMino();
-    display();
+    resetMino(game);
+    display(game);
 
-    next_drop_time = tick + 1; /* 次に落下する時刻 */
+    game->next_drop_time = tick + 1;
 
     while (1) {
-        /* ----- 1. キー入力処理 ----- */
-        c = inbyte(0);
+        /* 1. キー入力処理 (ポートIDを指定して入力) */
+        c = inbyte(game->port_id);
 
         if (c != -1) {
             switch (c) {
                 case 's': /* 下 */
-                    if (!isHit(minoX, minoY + 1, minoType, minoAngle)) {
-                        minoY++;
+                    if (!isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
+                        game->minoY++;
                     }
                     break;
                 case 'a': /* 左 */
-                    if (!isHit(minoX - 1, minoY, minoType, minoAngle)) {
-                        minoX--;
+                    if (!isHit(game, game->minoX - 1, game->minoY, game->minoType, game->minoAngle)) {
+                        game->minoX--;
                     }
                     break;
                 case 'd': /* 右 */
-                    if (!isHit(minoX + 1, minoY, minoType, minoAngle)) {
-                        minoX++;
+                    if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, game->minoAngle)) {
+                        game->minoX++;
                     }
                     break;
                 case ' ': /* 回転 */
-                    if (!isHit(minoX, minoY, minoType, (minoAngle + 1) % MINO_ANGLE_MAX)) {
-                        minoAngle = (minoAngle + 1) % MINO_ANGLE_MAX;
+                    if (!isHit(game, game->minoX, game->minoY, game->minoType, (game->minoAngle + 1) % MINO_ANGLE_MAX)) {
+                        game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
                     }
                     break;
-                default:
-                    break;
+                /* 追加: 強制終了やリセット機能など */
             }
-            display();
+            display(game);
         }
 
-        /* ----- 2. 時間経過による落下処理 ----- */
-        if (tick >= next_drop_time) {
-            next_drop_time = tick + 1; /* 速度調整: ここを変更すると速くなる (例: tick + 5 など) */
+        /* 2. 時間経過による落下処理 */
+        if (tick >= game->next_drop_time) {
+            game->next_drop_time = tick + 5; /* 速度調整 */
 
-            if (isHit(minoX, minoY + 1, minoType, minoAngle)) {
+            if (isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
                 /* 固定処理 */
                 for (i = 0; i < MINO_HEIGHT; i++) {
                     for (j = 0; j < MINO_WIDTH; j++) {
-                        if (minoShapes[minoType][minoAngle][i][j]) {
-                            /* フィールドにミノの種類ID(2〜8)を記録 */
-                            field[minoY + i][minoX + j] = 2 + minoType;
+                        if (minoShapes[game->minoType][game->minoAngle][i][j]) {
+                            game->field[game->minoY + i][game->minoX + j] = 2 + game->minoType;
                         }
                     }
                 }
                 
-                /* ライン消去判定 */
+                /* ライン消去判定 (game->field を操作) */
                 for (i = 0; i < FIELD_HEIGHT - 1; i++) {
                     int lineFill = 1;
                     for (j = 1; j < FIELD_WIDTH - 1; j++) {
-                        if (field[i][j] == 0) { /* 空白があれば消えない */
-                            lineFill = 0;
-                            break;
+                        if (game->field[i][j] == 0) {
+                            lineFill = 0; break;
                         }
                     }
                     if (lineFill) {
-                        /* 上の行をずらして消去 */
                         int k;
                         for (k = i; k > 0; k--) {
-                            memcpy(field[k], field[k - 1], FIELD_WIDTH);
+                            memcpy(game->field[k], game->field[k - 1], FIELD_WIDTH);
                         }
-                        /* 一番上は空(壁付き)に */
-                        memset(field[0], 0, FIELD_WIDTH);
-                        field[0][0] = field[0][FIELD_WIDTH-1] = 1;
+                        memset(game->field[0], 0, FIELD_WIDTH);
+                        game->field[0][0] = game->field[0][FIELD_WIDTH-1] = 1;
                     }
                 }
                 
-                resetMino();
+                resetMino(game);
                 
-                /* 生成直後のゲームオーバー判定 */
-                if (isHit(minoX, minoY, minoType, minoAngle)) {
-                    printf("GAME OVER\n");
-                    
-                    /* 盤面リセット */
-                    memset(field, 0, sizeof(field));
-                    for (i = 0; i < FIELD_HEIGHT; i++) {
-                        field[i][0] = field[i][FIELD_WIDTH - 1] = 1;
-                    }
-                    for (i = 0; i < FIELD_WIDTH; i++) {
-                        field[FIELD_HEIGHT - 1][i] = 1;
-                    }
+                /* ゲームオーバー判定 */
+                if (isHit(game, game->minoX, game->minoY, game->minoType, game->minoAngle)) {
+                    fprintf(game->fp_out, "GAME OVER\n");
+                    /* ここでリセット処理など */
+                    return; /* または break して再初期化 */
                 }
                 
             } else {
-                minoY++;
+                game->minoY++;
             }
-            display();
+            display(game);
         }
 
-        /* ----- 3. CPU譲渡 ----- */
+        /* 3. CPU譲渡 */
         skipmt();
+    }
+}
+
+/* -------------------------------------------------------------------
+ * タスク群
+ * ------------------------------------------------------------------- */
+/* タスク1 (Port 0) */
+void task1(void) {
+    TetrisGame game1;
+    
+    /* Game1 の設定 */
+    game1.port_id = 0;
+    game1.fp_out = com0out; /* mainでfdopenしたストリーム */
+    
+    /* 無限ループでゲームを回す */
+    while(1) {
+        run_tetris(&game1);
+        /* ゲームオーバー後，再スタートまでのウェイトなどを入れると良い */
+    }
+}
+
+/* タスク2 (Port 1) */
+void task2(void) {
+    TetrisGame game2;
+    
+    /* Game2 の設定 */
+    game2.port_id = 1;
+    game2.fp_out = com1out; /* mainでfdopenしたストリーム */
+    
+    while(1) {
+        run_tetris(&game2);
     }
 }
 
@@ -476,7 +512,17 @@ void game_task(void) {
  * ------------------------------------------------------------------- */
 int main(void) {
     init_kernel();
-    set_task(game_task);
+
+    /* ストリームの割り当て (test3.c を参考) */
+    com0in  = fdopen(0, "r");
+    com0out = fdopen(1, "w");
+    com1in  = fdopen(4, "r");
+    com1out = fdopen(4, "w");
+
+    /* タスク登録 */
+    set_task(task1);
+    set_task(task2);
+
     begin_sch();
     return 0;
 }
