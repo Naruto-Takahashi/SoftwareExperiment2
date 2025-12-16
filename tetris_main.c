@@ -40,7 +40,7 @@ extern void skipmt(void);       /* CPU譲渡 */
 #define COL_BLUE     "\x1b[34m"     /* J: 青 */
 #define COL_MAGENTA  "\x1b[35m"     /* L: 紫 */
 #define COL_WHITE    "\x1b[37m"     /* T: 白 */
-#define COL_WALL     "\x1b[30m"     /* 壁: 黒 */
+#define COL_WALL     "\x1b[37m"     /* 壁: 白 */
 
 /* -------------------------------------------------------------------
  * グローバル変数
