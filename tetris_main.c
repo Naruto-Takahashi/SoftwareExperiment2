@@ -1,10 +1,10 @@
 /* ===================================================================
  * tetris_main.c
- * M68k実験ボード用 テトリス移植版 (Port0 シングルプレイ用)
+ * M68k実験ボード用 テトリス (カラー対応 & カーソル常時表示版)
  * =================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h> /* memset, memcpy用 */
+#include <string.h>
 #include "mtk_c.h"
 
 /* -------------------------------------------------------------------
@@ -13,8 +13,8 @@
 extern void init_kernel(void);
 extern void set_task(void (*func)());
 extern void begin_sch(void);
-extern int inbyte(int ch);      /* ノンブロッキング入力 (inchrw.s) */
-extern void skipmt(void);       /* CPU譲渡 (mtk_asm.s/csys68k.c) */
+extern int inbyte(int ch);      /* ノンブロッキング入力 */
+extern void skipmt(void);       /* CPU譲渡 */
 
 /* -------------------------------------------------------------------
  * 定数・マクロ定義
@@ -28,12 +28,28 @@ extern void skipmt(void);       /* CPU譲渡 (mtk_asm.s/csys68k.c) */
 /* VT100 エスケープシーケンス */
 #define ESC_CLS      "\x1b[2J"      /* 画面クリア */
 #define ESC_HOME     "\x1b[H"       /* カーソルを左上へ */
+#define ESC_RESET    "\x1b[0m"      /* 色リセット */
 #define ESC_HIDE_CUR "\x1b[?25l"    /* カーソル非表示 */
 #define ESC_SHOW_CUR "\x1b[?25h"    /* カーソル表示 */
+
+/* 色定義 (文字色) */
+#define COL_CYAN     "\x1b[36m"     /* I: 水色 */
+#define COL_YELLOW   "\x1b[33m"     /* O: 黄色 */
+#define COL_GREEN    "\x1b[32m"     /* S: 緑 */
+#define COL_RED      "\x1b[31m"     /* Z: 赤 */
+#define COL_BLUE     "\x1b[34m"     /* J: 青 */
+#define COL_MAGENTA  "\x1b[35m"     /* L: 紫 */
+#define COL_WHITE    "\x1b[37m"     /* T: 白 */
+#define COL_WALL     "\x1b[30m"     /* 壁: 黒 */
 
 /* -------------------------------------------------------------------
  * グローバル変数
  * ------------------------------------------------------------------- */
+/* * fieldの値の意味:
+ * 0: 空白
+ * 1: 壁
+ * 2〜8: 固定されたミノの色ID (ミノタイプ + 2) 
+ */
 char field[FIELD_HEIGHT][FIELD_WIDTH];
 char displayBuffer[FIELD_HEIGHT][FIELD_WIDTH];
 
@@ -47,6 +63,17 @@ enum {
     MINO_TYPE_L,
     MINO_TYPE_T,
     MINO_TYPE_MAX
+};
+
+/* 色コードの配列 (MINO_TYPEの順に対応) */
+const char* minoColors[MINO_TYPE_MAX] = {
+    COL_CYAN,    /* I */
+    COL_YELLOW,  /* O */
+    COL_GREEN,   /* S */
+    COL_RED,     /* Z */
+    COL_BLUE,    /* J */
+    COL_MAGENTA, /* L */
+    COL_WHITE    /* T */
 };
 
 enum {
@@ -120,27 +147,40 @@ int minoX = 5, minoY = 0;
 /* 画面描画 */
 void display() {
     int i, j;
+    char cellVal;
 
-    /* 表示バッファ作成 */
+    /* 表示バッファ作成 (現在のフィールド状態をコピー) */
     memcpy(displayBuffer, field, sizeof(field));
+
+    /* 操作中のミノを表示バッファに書き込む */
+    /* ここでは 2 + minoType を書き込む (2〜8) */
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
             if (minoShapes[minoType][minoAngle][i][j]) {
-                displayBuffer[minoY + i][minoX + j] = 1;
+                displayBuffer[minoY + i][minoX + j] = 2 + minoType;
             }
         }
     }
 
-    /* カーソルを左上に戻す (画面クリアによるチラつき防止) */
+    /* カーソルを左上に戻す */
     printf(ESC_HOME);
 
-    /* 描画 */
+    /* 描画ループ */
     for (i = 0; i < FIELD_HEIGHT; i++) {
         for (j = 0; j < FIELD_WIDTH; j++) {
-            if (displayBuffer[i][j]) {
-                printf("[]"); /* ブロック */
-            } else {
+            cellVal = displayBuffer[i][j];
+
+            if (cellVal == 0) {
                 printf(" ."); /* 空白 */
+            } else if (cellVal == 1) {
+                /* 壁 (白) */
+                printf("%s[]%s", COL_WALL, ESC_RESET);
+            } else if (cellVal >= 2 && cellVal <= 8) {
+                /* ミノ (種類に応じた色) */
+                /* cellVal - 2 が minoType (0〜6) に対応 */
+                printf("%s[]%s", minoColors[cellVal - 2], ESC_RESET);
+            } else {
+                printf("??"); /* エラー */
             }
         }
         printf("\n");
@@ -154,7 +194,7 @@ int isHit(int _minoX, int _minoY, int _minoType, int _minoAngle) {
         for (j = 0; j < MINO_WIDTH; j++) {
             if (minoShapes[_minoType][_minoAngle][i][j] &&
                 field[_minoY + i][_minoX + j]) {
-                return 1; /* Hit */
+                return 1; /* Hit (壁または固定済みブロックに衝突) */
             }
         }
     }
@@ -165,14 +205,12 @@ int isHit(int _minoX, int _minoY, int _minoType, int _minoAngle) {
 void resetMino() {
     minoX = 5;
     minoY = 0;
-    /* rand() は stdlib.h にあるが、乱数種設定(srand)がないと同じ動きになる */
-    /* 今回は簡易的に tick を使って少しばらつきを持たせる */
     minoType = (tick + rand()) % MINO_TYPE_MAX;
     minoAngle = (tick + rand()) % MINO_ANGLE_MAX;
 }
 
 /* -------------------------------------------------------------------
- * ゲームタスク (メインループ)
+ * ゲームタスク
  * ------------------------------------------------------------------- */
 void game_task(void) {
     unsigned long next_drop_time;
@@ -180,12 +218,12 @@ void game_task(void) {
     int i, j;
 
     /* 初期化 */
-    printf(ESC_CLS);      /* 最初に一回だけクリア */
+    printf(ESC_CLS);      /* 画面クリア */
     printf(ESC_HIDE_CUR); /* カーソル非表示 */
     
     memset(field, 0, sizeof(field));
     
-    /* 壁と床の作成 */
+    /* 壁(1)と床(1)の作成 */
     for (i = 0; i < FIELD_HEIGHT; i++) {
         field[i][0] = field[i][FIELD_WIDTH - 1] = 1;
     }
@@ -196,15 +234,13 @@ void game_task(void) {
     resetMino();
     display();
 
-    next_drop_time = tick + 1; /* 次に落下する時刻 (tick単位) */
+    next_drop_time = tick + 1; /* 次に落下する時刻 */
 
     while (1) {
-        /* ----- 1. キー入力処理 (ノンブロッキング) ----- */
-        /* Port0 (UART1) からの直接入力をチェック */
+        /* ----- 1. キー入力処理 ----- */
         c = inbyte(0);
 
         if (c != -1) {
-            /* キー入力があった場合 */
             switch (c) {
                 case 's': /* 下 */
                     if (!isHit(minoX, minoY + 1, minoType, minoAngle)) {
@@ -221,7 +257,7 @@ void game_task(void) {
                         minoX++;
                     }
                     break;
-                case ' ': /* 回転 (Space) */
+                case ' ': /* 回転 */
                     if (!isHit(minoX, minoY, minoType, (minoAngle + 1) % MINO_ANGLE_MAX)) {
                         minoAngle = (minoAngle + 1) % MINO_ANGLE_MAX;
                     }
@@ -229,23 +265,20 @@ void game_task(void) {
                 default:
                     break;
             }
-            display(); /* 入力があったらすぐ描画更新 */
+            display();
         }
 
         /* ----- 2. 時間経過による落下処理 ----- */
-        /* 現在の tick が設定時刻を過ぎているかチェック */
         if (tick >= next_drop_time) {
-            /* 次の落下時刻を設定 (スピード調整はここで行う) */
-            /* 現在のタイマ設定(1秒)だと '1' で1秒ごとの落下 */
-            /* もっと速くしたい場合は mtk_asm.s の init_timer 値を変更する必要あり */
-            next_drop_time = tick + 1; 
+            next_drop_time = tick + 1; /* 速度調整: ここを変更すると速くなる (例: tick + 5 など) */
 
             if (isHit(minoX, minoY + 1, minoType, minoAngle)) {
                 /* 固定処理 */
                 for (i = 0; i < MINO_HEIGHT; i++) {
                     for (j = 0; j < MINO_WIDTH; j++) {
                         if (minoShapes[minoType][minoAngle][i][j]) {
-                            field[minoY + i][minoX + j] = 1;
+                            /* フィールドにミノの種類ID(2〜8)を記録 */
+                            field[minoY + i][minoX + j] = 2 + minoType;
                         }
                     }
                 }
@@ -254,7 +287,7 @@ void game_task(void) {
                 for (i = 0; i < FIELD_HEIGHT - 1; i++) {
                     int lineFill = 1;
                     for (j = 1; j < FIELD_WIDTH - 1; j++) {
-                        if (!field[i][j]) {
+                        if (field[i][j] == 0) { /* 空白があれば消えない */
                             lineFill = 0;
                             break;
                         }
@@ -265,7 +298,7 @@ void game_task(void) {
                         for (k = i; k > 0; k--) {
                             memcpy(field[k], field[k - 1], FIELD_WIDTH);
                         }
-                        /* 一番上は空に */
+                        /* 一番上は空(壁付き)に */
                         memset(field[0], 0, FIELD_WIDTH);
                         field[0][0] = field[0][FIELD_WIDTH-1] = 1;
                     }
@@ -273,10 +306,11 @@ void game_task(void) {
                 
                 resetMino();
                 
-                /* 生成直後に当たっていたらゲームオーバー (簡易リセット) */
+                /* 生成直後のゲームオーバー判定 */
                 if (isHit(minoX, minoY, minoType, minoAngle)) {
                     printf("GAME OVER\n");
-                    /* ここでループを抜けるか、盤面リセットなどの処理を入れる */
+                    
+                    /* 盤面リセット */
                     memset(field, 0, sizeof(field));
                     for (i = 0; i < FIELD_HEIGHT; i++) {
                         field[i][0] = field[i][FIELD_WIDTH - 1] = 1;
@@ -287,14 +321,12 @@ void game_task(void) {
                 }
                 
             } else {
-                minoY++; /* 落下 */
+                minoY++;
             }
-            
-            display(); /* 時間経過更新 */
+            display();
         }
 
         /* ----- 3. CPU譲渡 ----- */
-        /* 入力がなくてもループを回し続けるため、他タスクのためにCPUを放す */
         skipmt();
     }
 }
@@ -304,12 +336,7 @@ void game_task(void) {
  * ------------------------------------------------------------------- */
 int main(void) {
     init_kernel();
-
-    /* ゲームタスクの登録 */
     set_task(game_task);
-
-    /* 開始 */
     begin_sch();
-
     return 0;
 }
