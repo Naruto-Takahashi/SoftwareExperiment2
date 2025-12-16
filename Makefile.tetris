@@ -1,0 +1,22 @@
+################################################################
+
+### Software Jikken -- Makefile for Tetris
+
+################################################################
+
+PROGRAM = tetris
+
+# mon.o must be first so that ld places mon.o $400.
+
+# test3.o の代わりに tetris_main.o をリンクします
+
+OBJECTS = crt0.o mon.o csys68k.o inchrw.o mtk_asm.o \
+ mtk_c.o outchr.o tetris_main.o
+
+SRCS = crt0.s mon.s csys68k.c inchrw.s mtk_asm.s \
+ mtk_c.c outchr.s tetris_main.c
+
+ASMGLIS = crt0.glis mon.glis csys68k.glis inchrw.glis mtk_asm.glis \
+ mtk_c.glis outchr.glis tetris_main.glis
+
+include $(LIB_JIKKEN)/make.conf
