@@ -1,6 +1,6 @@
 /* ===================================================================
- * tetris_main.c (7-Bag System Ver.)
- * 差分描画 + 7種1巡(バッグシステム)実装済み
+ * tetris_main.c (Color Config Ver.)
+ * 差分描画 + 7種1巡 + 色変更(L:黄, O:白, T:紫)
  * =================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,12 +46,12 @@ extern void skipmt(void);       /* CPU譲渡 */
 
 /* 色定義 (文字色) */
 #define COL_CYAN     "\x1b[36m"     /* I: 水色 */
-#define COL_YELLOW   "\x1b[33m"     /* O: 黄色 */
+#define COL_YELLOW   "\x1b[33m"     /* O: 白 */
 #define COL_GREEN    "\x1b[32m"     /* S: 緑 */
 #define COL_RED      "\x1b[31m"     /* Z: 赤 */
 #define COL_BLUE     "\x1b[34m"     /* J: 青 */
-#define COL_MAGENTA  "\x1b[35m"     /* L: 紫 */
-#define COL_WHITE    "\x1b[37m"     /* T: 白 */
+#define COL_MAGENTA  "\x1b[35m"     /* L: 黄色 */
+#define COL_WHITE    "\x1b[37m"     /* T: 紫 */
 #define COL_WALL     "\x1b[37m"     /* 壁: 白 */
 
 /* -------------------------------------------------------------------
@@ -74,7 +74,7 @@ typedef struct {
     int minoX;
     int minoY;
     
-    /* ★追加: 7種1巡(7-Bag)システム用 */
+    /* 7種1巡(7-Bag)システム用 */
     int bag[7];      /* ミノの補充用バッグ */
     int bag_index;   /* 次に取り出すバッグのインデックス (0-6) */
 
@@ -103,15 +103,15 @@ enum {
     MINO_TYPE_MAX
 };
 
-/* 色コードの配列 (MINO_TYPEの順に対応) */
+/* 色コードの割り当て */
 const char* minoColors[MINO_TYPE_MAX] = {
-    COL_CYAN,    /* I */
-    COL_YELLOW,  /* O */
-    COL_GREEN,   /* S */
-    COL_RED,     /* Z */
-    COL_BLUE,    /* J */
-    COL_MAGENTA, /* L */
-    COL_WHITE    /* T */
+    COL_CYAN,    /* I: 水色 */
+    COL_WHITE,   /* O: 白   */
+    COL_GREEN,   /* S: 緑   */
+    COL_RED,     /* Z: 赤   */
+    COL_BLUE,    /* J: 青   */
+    COL_YELLOW,  /* L: 黄色 */
+    COL_MAGENTA  /* T: 紫   */
 };
 
 enum {
@@ -347,7 +347,6 @@ void display(TetrisGame *game) {
     fprintf(game->fp_out, "\n--------------------------");
 
     /* 3. 盤面の差分描画 */
-    /* 盤面は3行目から始まると仮定 */
     int offset_y = 3; 
 
     for (i = 0; i < FIELD_HEIGHT; i++) {
@@ -407,7 +406,7 @@ int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngl
     return 0;
 }
 
-/* ★追加: バッグの初期化・シャッフル */
+/* バッグの初期化・シャッフル */
 void fillBag(TetrisGame *game) {
     int i, j, temp;
     
@@ -416,10 +415,9 @@ void fillBag(TetrisGame *game) {
         game->bag[i] = i;
     }
     
-    /* 2. シャッフル (Fisher-Yates shuffle 的な処理) */
-    /* 乱数には tick と rand() を組み合わせる */
+    /* 2. シャッフル */
     for (i = 6; i > 0; i--) {
-        j = (tick + rand()) % (i + 1); /* 0 から i までの乱数 */
+        j = (tick + rand()) % (i + 1); 
         
         /* bag[i] と bag[j] を交換 */
         temp = game->bag[i];
@@ -463,7 +461,7 @@ void run_tetris(TetrisGame *game) {
     game->force_refresh = 1;
     memset(game->prevBuffer, 0, sizeof(game->prevBuffer));
     
-    /* ★バッグシステムの初期化 (7にしておくと最初のresetMinoでfillBagが呼ばれる) */
+    /* バッグシステムの初期化 */
     game->bag_index = 7;
 
     fprintf(game->fp_out, ESC_CLS);      
