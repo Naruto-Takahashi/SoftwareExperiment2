@@ -515,7 +515,7 @@ void run_tetris(TetrisGame *game) {
                 
                 /* ゲームオーバー判定 */
                 if (isHit(game, game->minoX, game->minoY, game->minoType, game->minoAngle)) {
-                    fprintf(game->fp_out, "\n%sGAME OVER\n", ESC_RED);
+                    fprintf(game->fp_out, "\n%sGAME OVER\n", COL_RED);
                     fprintf(game->fp_out, "Final Score: %d%s\n", game->score, ESC_RESET);
                     /* ここでリセット処理など */
                     
