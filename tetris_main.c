@@ -1,5 +1,5 @@
 /* ===================================================================
- * tetris_main.c
+ * tetris_main.c (Score Display Ver.)
  * M68k実験ボード用テトリスゲーム本体
  * =================================================================== */
 #include <stdio.h>
@@ -39,6 +39,7 @@ extern void skipmt(void);       /* CPU譲渡 */
 #define ESC_RESET    "\x1b[0m"      /* 色リセット */
 #define ESC_HIDE_CUR "\x1b[?25l"    /* カーソル非表示 */
 #define ESC_SHOW_CUR "\x1b[?25h"    /* カーソル表示 */
+#define ESC_CLR_LINE "\x1b[K"       /* 行末までクリア */
 
 /* 色定義 (文字色) */
 #define COL_CYAN     "\x1b[36m"     /* I: 水色 */
@@ -60,13 +61,19 @@ typedef struct {
     char field[FIELD_HEIGHT][FIELD_WIDTH];
     char displayBuffer[FIELD_HEIGHT][FIELD_WIDTH];
     
+    /* ミノの状態 */
     int minoType;
     int minoAngle;
     int minoX;
     int minoY;
     
+    /* ゲーム進行管理 */
     unsigned long next_drop_time;
-    unsigned int random_seed; /* 乱数シードも個別に持つ */
+    unsigned int random_seed; 
+    
+    /* スコア管理 */
+    int score;
+    int lines_cleared;
 } TetrisGame;
 
 /* -------------------------------------------------------------------
@@ -313,13 +320,23 @@ void display(TetrisGame *game) {
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
             if (minoShapes[game->minoType][game->minoAngle][i][j]) {
-                game->displayBuffer[game->minoY + i][game->minoX + j] = 2 + game->minoType;
+                /* 範囲チェック: 画面外への書き込み防止 */
+                if (game->minoY + i >= 0 && game->minoY + i < FIELD_HEIGHT &&
+                    game->minoX + j >= 0 && game->minoX + j < FIELD_WIDTH) {
+                    game->displayBuffer[game->minoY + i][game->minoX + j] = 2 + game->minoType;
+                }
             }
         }
     }
 
-    /* カーソルを左上に戻す (fprintfを使用) */
+    /* カーソルを左上に戻す */
     fprintf(game->fp_out, ESC_HOME);
+
+    /* スコアとライン数の表示 */
+    /* ESC_CLR_LINE (\x1b[K) で行の残りを消去してゴミが残らないようにする */
+    fprintf(game->fp_out, "SCORE: %-6d  LINES: %-4d%s\n", 
+            game->score, game->lines_cleared, ESC_CLR_LINE);
+    fprintf(game->fp_out, "--------------------------%s\n", ESC_CLR_LINE);
 
     /* 描画ループ */
     for (i = 0; i < FIELD_HEIGHT; i++) {
@@ -337,28 +354,38 @@ void display(TetrisGame *game) {
                 fprintf(game->fp_out, "??");
             }
         }
-        fprintf(game->fp_out, "\n");
+        /* 行末で改行と行クリア */
+        fprintf(game->fp_out, "%s\n", ESC_CLR_LINE);
     }
     
     /* バッファをフラッシュして即時表示させる */
     fflush(game->fp_out);
 }
 
-/* 当たり判定 (構造体対応版) */
+/* 当たり判定 */
 int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngle) {
     int i, j;
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
-            if (minoShapes[_minoType][_minoAngle][i][j] &&
-                game->field[_minoY + i][_minoX + j]) {
-                return 1; 
+            if (minoShapes[_minoType][_minoAngle][i][j]) {
+                int fy = _minoY + i;
+                int fx = _minoX + j;
+                
+                /* 範囲外チェック */
+                if (fy < 0 || fy >= FIELD_HEIGHT || fx < 0 || fx >= FIELD_WIDTH) {
+                    return 1;
+                }
+                /* 既にブロックがあるか */
+                if (game->field[fy][fx]) {
+                    return 1;
+                }
             }
         }
     }
     return 0;
 }
 
-/* ミノのリセット (構造体対応版) */
+/* ミノのリセット */
 void resetMino(TetrisGame *game) {
     game->minoX = 5;
     game->minoY = 0;
@@ -373,8 +400,11 @@ void resetMino(TetrisGame *game) {
 void run_tetris(TetrisGame *game) {
     int c;
     int i, j;
-
+    
     /* 初期化 */
+    game->score = 0;         /* スコア初期化 */
+    game->lines_cleared = 0; /* ライン数初期化 */
+
     fprintf(game->fp_out, ESC_CLS);      
     fprintf(game->fp_out, ESC_HIDE_CUR); 
     
@@ -419,40 +449,65 @@ void run_tetris(TetrisGame *game) {
                         game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
                     }
                     break;
-                /* 追加: 強制終了やリセット機能など */
+                case 'q': /* 強制終了 */
+                    fprintf(game->fp_out, "%sQuit.\n", ESC_SHOW_CUR);
+                    return;
             }
             display(game);
         }
 
         /* 2. 時間経過による落下処理 */
         if (tick >= game->next_drop_time) {
-            game->next_drop_time = tick + 5; /* 速度調整 */
+            game->next_drop_time = tick + 1; /* 速度調整 (数値を減らすと速くなる) */
 
             if (isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
                 /* 固定処理 */
                 for (i = 0; i < MINO_HEIGHT; i++) {
                     for (j = 0; j < MINO_WIDTH; j++) {
                         if (minoShapes[game->minoType][game->minoAngle][i][j]) {
-                            game->field[game->minoY + i][game->minoX + j] = 2 + game->minoType;
+                            if (game->minoY + i >= 0 && game->minoY + i < FIELD_HEIGHT &&
+                                game->minoX + j >= 0 && game->minoX + j < FIELD_WIDTH) {
+                                game->field[game->minoY + i][game->minoX + j] = 2 + game->minoType;
+                            }
                         }
                     }
                 }
                 
-                /* ライン消去判定 (game->field を操作) */
-                for (i = 0; i < FIELD_HEIGHT - 1; i++) {
-                    int lineFill = 1;
-                    for (j = 1; j < FIELD_WIDTH - 1; j++) {
-                        if (game->field[i][j] == 0) {
-                            lineFill = 0; break;
+                /* ライン消去判定 & スコア計算 */
+                {
+                    int lines_this_turn = 0;
+                    
+                    for (i = 0; i < FIELD_HEIGHT - 1; i++) {
+                        int lineFill = 1;
+                        for (j = 1; j < FIELD_WIDTH - 1; j++) {
+                            if (game->field[i][j] == 0) {
+                                lineFill = 0; break;
+                            }
+                        }
+                        if (lineFill) {
+                            int k;
+                            /* ラインを消して上から詰める */
+                            for (k = i; k > 0; k--) {
+                                memcpy(game->field[k], game->field[k - 1], FIELD_WIDTH);
+                            }
+                            /* 最上段は壁以外0にする */
+                            memset(game->field[0], 0, FIELD_WIDTH);
+                            game->field[0][0] = game->field[0][FIELD_WIDTH-1] = 1;
+                            
+                            lines_this_turn++; /* 消去ライン数カウント */
                         }
                     }
-                    if (lineFill) {
-                        int k;
-                        for (k = i; k > 0; k--) {
-                            memcpy(game->field[k], game->field[k - 1], FIELD_WIDTH);
+
+                    /* スコア加算処理 */
+                    if (lines_this_turn > 0) {
+                        game->lines_cleared += lines_this_turn;
+                        switch (lines_this_turn) {
+                            case 1: game->score += 100; break;
+                            case 2: game->score += 300; break;
+                            case 3: game->score += 500; break;
+                            case 4: game->score += 800; break;
+                            default: game->score += 100 * lines_this_turn; break;
                         }
-                        memset(game->field[0], 0, FIELD_WIDTH);
-                        game->field[0][0] = game->field[0][FIELD_WIDTH-1] = 1;
                     }
                 }
                 
@@ -460,9 +515,14 @@ void run_tetris(TetrisGame *game) {
                 
                 /* ゲームオーバー判定 */
                 if (isHit(game, game->minoX, game->minoY, game->minoType, game->minoAngle)) {
-                    fprintf(game->fp_out, "GAME OVER\n");
+                    fprintf(game->fp_out, "\n%sGAME OVER\n", ESC_RED);
+                    fprintf(game->fp_out, "Final Score: %d%s\n", game->score, ESC_RESET);
                     /* ここでリセット処理など */
-                    return; /* または break して再初期化 */
+                    
+                    /* とりあえず無限ループで止めるか、リターンして再ゲーム */
+                    /* (今回は単純にリターンして再スタートさせる) */
+                    // while(1) skipmt(); 
+                    return; 
                 }
                 
             } else {
@@ -490,7 +550,9 @@ void task1(void) {
     /* 無限ループでゲームを回す */
     while(1) {
         run_tetris(&game1);
-        /* ゲームオーバー後，再スタートまでのウェイトなどを入れると良い */
+        /* ゲームオーバー後，少し待って再スタート */
+        int i;
+        for(i=0; i<100000; i++); 
     }
 }
 
@@ -504,6 +566,8 @@ void task2(void) {
     
     while(1) {
         run_tetris(&game2);
+        int i;
+        for(i=0; i<100000; i++);
     }
 }
 
@@ -513,7 +577,7 @@ void task2(void) {
 int main(void) {
     init_kernel();
 
-    /* ストリームの割り当て (test3.c を参考) */
+    /* ストリームの割り当て */
     com0in  = fdopen(0, "r");
     com0out = fdopen(1, "w");
     com1in  = fdopen(4, "r");
