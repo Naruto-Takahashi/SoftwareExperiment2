@@ -52,7 +52,8 @@ extern void skipmt(void);       /* CPU時間を自発的に譲る */
 #define COL_RED      "\x1b[31m"     /* Zミノ */
 #define COL_BLUE     "\x1b[34m"     /* Jミノ */
 #define COL_MAGENTA  "\x1b[35m"     /* Tミノ */
-#define COL_WHITE    "\x1b[37m"     /* Oミノ，壁 */
+#define COL_WHITE    "\x1b[37m"     /* Oミノ */
+#define COL_WALL     "\x1b[37m"     /* 壁 */
 #define COL_GRAY     "\x1b[37m"     /* お邪魔ブロック (白で代用) */
 
 /* -------------------------------------------------------------------
