@@ -33,6 +33,9 @@ extern void skipmt(void);       /* CPU譲渡 */
 #define MINO_WIDTH   4
 #define MINO_HEIGHT  4
 
+/* 落下スピード */
+#define DROP_INTERVAL 5
+
 /* VT100 エスケープシーケンス */
 #define ESC_CLS      "\x1b[2J"      /* 画面クリア */
 #define ESC_HOME     "\x1b[H"       /* カーソルを左上へ */
@@ -421,7 +424,7 @@ void run_tetris(TetrisGame *game) {
     resetMino(game);
     display(game);
 
-    game->next_drop_time = tick + 1;
+    game->next_drop_time = tick + DROP_INTERVAL;
 
     while (1) {
         /* 1. キー入力処理 (ポートIDを指定して入力) */
@@ -432,6 +435,7 @@ void run_tetris(TetrisGame *game) {
                 case 's': /* 下 */
                     if (!isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
                         game->minoY++;
+                        game->next_drop_time  = tick + DROP_INTERVAL;
                     }
                     break;
                 case 'a': /* 左 */
@@ -458,7 +462,7 @@ void run_tetris(TetrisGame *game) {
 
         /* 2. 時間経過による落下処理 */
         if (tick >= game->next_drop_time) {
-            game->next_drop_time = tick + 1; /* 速度調整 (数値を減らすと速くなる) */
+            game->next_drop_time = tick + DROP_INTERVAL; /* 速度調整 (数値を減らすと速くなる) */
 
             if (isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
                 /* 固定処理 */
