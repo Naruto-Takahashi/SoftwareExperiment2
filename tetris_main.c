@@ -552,7 +552,11 @@ void task1(void) {
         run_tetris(&game1);
         /* ゲームオーバー後，少し待って再スタート */
         int i;
-        for(i=0; i<100000; i++); 
+        for(i=0; i<100000; i++){
+			if (i % 100 == 0) {
+				skipmt();
+			}
+		}
     }
 }
 
@@ -567,7 +571,11 @@ void task2(void) {
     while(1) {
         run_tetris(&game2);
         int i;
-        for(i=0; i<100000; i++);
+        for(i=0; i<100000; i++){
+			if (i % 100 == 0) {
+				skipmt();
+			}
+		}
     }
 }
 
