@@ -1,6 +1,6 @@
 /* ===================================================================
- * tetris_main.c (Diff Render Ver.)
- * 差分描画適用・入力ロジックは維持
+ * tetris_main.c (7-Bag System Ver.)
+ * 差分描画 + 7種1巡(バッグシステム)実装済み
  * =================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +74,10 @@ typedef struct {
     int minoX;
     int minoY;
     
+    /* ★追加: 7種1巡(7-Bag)システム用 */
+    int bag[7];      /* ミノの補充用バッグ */
+    int bag_index;   /* 次に取り出すバッグのインデックス (0-6) */
+
     /* ゲーム進行管理 */
     unsigned long next_drop_time;
     unsigned int random_seed; 
@@ -337,14 +341,13 @@ void display(TetrisGame *game) {
     }
 
     /* 2. スコア表示 (ここは毎回更新) */
-    /* カーソルを左上(1,1)へ移動 */
     fprintf(game->fp_out, "\x1b[1;1H"); 
     fprintf(game->fp_out, "SCORE: %-6d  LINES: %-4d%s", 
             game->score, game->lines_cleared, ESC_CLR_LINE);
     fprintf(game->fp_out, "\n--------------------------");
 
     /* 3. 盤面の差分描画 */
-    /* 盤面は3行目から始まると仮定 (スコア表示:1行目, 区切り:2行目) */
+    /* 盤面は3行目から始まると仮定 */
     int offset_y = 3; 
 
     for (i = 0; i < FIELD_HEIGHT; i++) {
@@ -354,8 +357,7 @@ void display(TetrisGame *game) {
             /* 強制再描画フラグが立っているか、内容が変化していたら描画する */
             if (game->force_refresh || cellVal != game->prevBuffer[i][j]) {
                 
-                /* カーソルをピンポイントで移動 ( VT100: \x1b[行;列H ) */
-                /* 行: i + offset_y, 列: j * 2 + 1 (半角2文字分なのでx2, 1始まり) */
+                /* カーソルをピンポイントで移動 */
                 fprintf(game->fp_out, "\x1b[%d;%dH", i + offset_y, j * 2 + 1);
 
                 /* マスの描画 */
@@ -393,11 +395,9 @@ int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngl
                 int fy = _minoY + i;
                 int fx = _minoX + j;
                 
-                /* 範囲外チェック */
                 if (fy < 0 || fy >= FIELD_HEIGHT || fx < 0 || fx >= FIELD_WIDTH) {
                     return 1;
                 }
-                /* 既にブロックがあるか */
                 if (game->field[fy][fx]) {
                     return 1;
                 }
@@ -407,11 +407,44 @@ int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngl
     return 0;
 }
 
-/* ミノのリセット */
+/* ★追加: バッグの初期化・シャッフル */
+void fillBag(TetrisGame *game) {
+    int i, j, temp;
+    
+    /* 1. バッグに7種類のミノを入れる */
+    for (i = 0; i < 7; i++) {
+        game->bag[i] = i;
+    }
+    
+    /* 2. シャッフル (Fisher-Yates shuffle 的な処理) */
+    /* 乱数には tick と rand() を組み合わせる */
+    for (i = 6; i > 0; i--) {
+        j = (tick + rand()) % (i + 1); /* 0 から i までの乱数 */
+        
+        /* bag[i] と bag[j] を交換 */
+        temp = game->bag[i];
+        game->bag[i] = game->bag[j];
+        game->bag[j] = temp;
+    }
+    
+    game->bag_index = 0; /* インデックスを先頭に戻す */
+}
+
+/* ミノのリセット (7-Bag仕様) */
 void resetMino(TetrisGame *game) {
     game->minoX = 5;
     game->minoY = 0;
-    game->minoType = (tick + rand()) % MINO_TYPE_MAX; 
+    
+    /* バッグが空(7個使い切った)なら補充・シャッフル */
+    if (game->bag_index >= 7) {
+        fillBag(game);
+    }
+    
+    /* バッグから1つ取り出す */
+    game->minoType = game->bag[game->bag_index];
+    game->bag_index++; /* 次へ進める */
+    
+    /* 角度はランダムでOK */
     game->minoAngle = (tick + rand()) % MINO_ANGLE_MAX;
 }
 
@@ -426,9 +459,12 @@ void run_tetris(TetrisGame *game) {
     game->score = 0;
     game->lines_cleared = 0;
     
-    /* ★追加: 差分描画用の初期化 */
+    /* 差分描画用の初期化 */
     game->force_refresh = 1;
     memset(game->prevBuffer, 0, sizeof(game->prevBuffer));
+    
+    /* ★バッグシステムの初期化 (7にしておくと最初のresetMinoでfillBagが呼ばれる) */
+    game->bag_index = 7;
 
     fprintf(game->fp_out, ESC_CLS);      
     fprintf(game->fp_out, ESC_HIDE_CUR); 
@@ -449,7 +485,7 @@ void run_tetris(TetrisGame *game) {
     game->next_drop_time = tick + DROP_INTERVAL;
 
     while (1) {
-        /* 1. キー入力処理 (元のロジック維持: 1ループ1入力処理) */
+        /* 1. キー入力処理 */
         c = inbyte(game->port_id);
 
         if (c != -1) {
@@ -512,7 +548,6 @@ void run_tetris(TetrisGame *game) {
                         }
                         if (lineFill) {
                             int k;
-                            /* ラインを消して上から詰める */
                             for (k = i; k > 0; k--) {
                                 memcpy(game->field[k], game->field[k - 1], FIELD_WIDTH);
                             }
