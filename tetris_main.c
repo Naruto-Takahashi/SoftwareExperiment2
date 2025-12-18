@@ -1,6 +1,7 @@
 /* ===================================================================
  * tetris_main.c
  * 機能: 2ポート対戦，差分描画，7種1巡，お邪魔ブロック攻撃
+ * 変更: 背景黒化，RGBカラー指定への対応
  * =================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,16 +45,24 @@ extern void skipmt(void);       /* CPU時間を自発的に譲る */
 #define ESC_SHOW_CUR "\x1b[?25h"    /* カーソルを表示 */
 #define ESC_CLR_LINE "\x1b[K"       /* カーソル位置から行末まで消去 */
 
-/* 色定義 (文字色) */
-#define COL_CYAN     "\x1b[36m"     /* Iミノ */
-#define COL_YELLOW   "\x1b[33m"     /* Lミノ */
-#define COL_GREEN    "\x1b[32m"     /* Sミノ */
-#define COL_RED      "\x1b[31m"     /* Zミノ */
-#define COL_BLUE     "\x1b[34m"     /* Jミノ */
-#define COL_MAGENTA  "\x1b[35m"     /* Tミノ */
-#define COL_WHITE    "\x1b[37m"     /* Oミノ */
-#define COL_WALL     "\x1b[37m"     /* 壁 */
-#define COL_GRAY     "\x1b[37m"     /* お邪魔ブロック (白で代用) */
+/* * 色定義 (文字色) - RGB指定 (TrueColor)
+ * フォーマット: \x1b[38;2;R;G;Bm
+ */
+#define COL_CYAN     "\x1b[38;2;0;255;255m"     /* Iミノ: 水色 */
+#define COL_YELLOW   "\x1b[38;2;255;255;0m"     /* Oミノ: 黄色 */
+#define COL_PURPLE   "\x1b[38;2;160;32;240m"    /* Tミノ: 紫 */
+#define COL_BLUE     "\x1b[38;2;0;0;255m"       /* Jミノ: 青 */
+#define COL_ORANGE   "\x1b[38;2;255;165;0m"     /* Lミノ: オレンジ */
+#define COL_GREEN    "\x1b[38;2;0;255;0m"       /* Sミノ: 緑 */
+#define COL_RED      "\x1b[38;2;255;0;0m"       /* Zミノ: 赤 */
+#define COL_WHITE    "\x1b[38;2;255;255;255m"   /* 壁: 白 */
+#define COL_GRAY     "\x1b[38;2;128;128;128m"   /* お邪魔ブロック: 灰色 */
+
+/* 背景色定義 */
+#define BG_BLACK     "\x1b[40m"                 /* 背景: 黒 */
+
+/* 壁の色として使用するマクロ */
+#define COL_WALL     COL_WHITE
 
 /* -------------------------------------------------------------------
  * ゲーム状態を管理する構造体の定義
@@ -121,13 +130,13 @@ enum {
 /* ミノの色定義 (指定された配色) */
 const char* minoColors[MINO_TYPE_MAX] = {
     COL_CYAN,    /* I: 水色 */
-    COL_WHITE,   /* O: 白 */
+    COL_YELLOW,  /* O: 黄色 */
     COL_GREEN,   /* S: 緑 */
     COL_RED,     /* Z: 赤 */
     COL_BLUE,    /* J: 青 */
-    COL_YELLOW,  /* L: 黄色 */
-    COL_MAGENTA, /* T: 紫 */
-    COL_GRAY     /* Garbage */
+    COL_ORANGE,  /* L: オレンジ */
+    COL_PURPLE,  /* T: 紫 */
+    COL_GRAY     /* Garbage: 灰色 */
 };
 
 /* 回転角度 */
@@ -246,12 +255,13 @@ void display(TetrisGame *game) {
                 fprintf(game->fp_out, "\x1b[%d;%dH", i + offset_y, j * 2 + 1);
 
                 /* セルの内容に応じた描画 */
+                /* BG_BLACK を指定して背景を黒にする */
                 if (cellVal == 0) {
-                    fprintf(game->fp_out, " .");
+                    fprintf(game->fp_out, "%s .%s", BG_BLACK, ESC_RESET);
                 } else if (cellVal == 1) {
-                    fprintf(game->fp_out, "%s[]%s", COL_WALL, ESC_RESET);
+                    fprintf(game->fp_out, "%s%s[]%s", BG_BLACK, COL_WALL, ESC_RESET);
                 } else if (cellVal >= 2 && cellVal <= 9) { /* 9はGARBAGE */
-                    fprintf(game->fp_out, "%s[]%s", minoColors[cellVal - 2], ESC_RESET);
+                    fprintf(game->fp_out, "%s%s[]%s", BG_BLACK, minoColors[cellVal - 2], ESC_RESET);
                 } else {
                     fprintf(game->fp_out, "??");
                 }
