@@ -1,5 +1,5 @@
 /* ===================================================================
- * tetris_main.c (Final Battle Ver. with Comments)
+ * tetris_main.c
  * 機能: 2ポート対戦，差分描画，7種1巡，お邪魔ブロック攻撃
  * =================================================================== */
 #include <stdio.h>
@@ -9,7 +9,6 @@
 
 /* -------------------------------------------------------------------
  * ファイルポインタの参照 (extern)
- * 実体は mtk_c.c または test3.c で定義
  * ------------------------------------------------------------------- */
 extern FILE *com0in;
 extern FILE *com0out;
@@ -493,7 +492,7 @@ void run_tetris(TetrisGame *game) {
                         game->lines_cleared += lines_this_turn;
                         game->force_refresh = 1; /* 画面更新 */
                         
-                        /* ★攻撃処理: 相手にお邪魔ブロックを送る */
+                        /* 攻撃処理: 相手にお邪魔ブロックを送る */
                         int attack = 0;
                         if (lines_this_turn == 2) attack = 1;      /* ダブル -> 1段 */
                         if (lines_this_turn == 3) attack = 2;      /* トリプル -> 2段 */
@@ -594,7 +593,7 @@ void task2(void) {
 int main(void) {
     init_kernel(); /* カーネル初期化 */
 
-    /* ファイルディスクリプタの割り当て (test3.c 準拠) */
+    /* ファイルディスクリプタの割り当て */
     com0in  = fdopen(0, "r");
     com0out = fdopen(1, "w");
     com1in  = fdopen(4, "r");
