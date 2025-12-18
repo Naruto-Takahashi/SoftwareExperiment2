@@ -35,7 +35,7 @@ extern void skipmt(void);       /* CPU時間を自発的に譲る */
 #define MINO_HEIGHT  4
 
 /* 落下スピード (tick単位) */
-#define DROP_INTERVAL 5
+#define DROP_INTERVAL 1000
 
 /* VT100 エスケープシーケンス (画面制御用) */
 #define ESC_CLS      "\x1b[2J"      /* 画面全体クリア */
