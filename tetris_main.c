@@ -362,12 +362,12 @@ int processGarbage(TetrisGame *game) {
 
     /* 2. フィールド全体を上にずらす (メモリコピー) */
     /* 下の行を上の行へコピー */
-    for (i = 0; i < FIELD_HEIGHT - lines; i++) {
+    for (i = 0; i < FIELD_HEIGHT - 1 - lines; i++) {
         memcpy(game->field[i], game->field[i + lines], FIELD_WIDTH);
     }
 
     /* 3. 下からお邪魔ブロックラインを生成 */
-    for (i = FIELD_HEIGHT - lines; i < FIELD_HEIGHT; i++) {
+    for (i = FIELD_HEIGHT - 1 - lines; i < FIELD_HEIGHT - 1; i++) {
         /* 両端は壁 */
         game->field[i][0] = 1;
         game->field[i][FIELD_WIDTH - 1] = 1;
