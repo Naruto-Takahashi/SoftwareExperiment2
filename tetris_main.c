@@ -1,11 +1,11 @@
 /* ===================================================================
  * tetris_main.c
  * テーマ3対応: イベント駆動型マルチタスク (Event-Driven)
- * * 機能: 
- * - イベントディスパッチャ (wait_event) の導入
- * - キー入力，タイマー，攻撃判定をイベントとして統一管理
+ * 機能: 
+ * - 矢印キー (VT100エスケープシーケンス) 対応
+ * - WASDキー対応 (Wで回転を追加)
+ * - イベントディスパッチャ (wait_event)
  * - 落下速度調整 (20tick)
- * - お邪魔ブロックせり上がり位置修正
  * - 勝敗判定と画面制御
  * =================================================================== */
 #include <stdio.h>
@@ -39,7 +39,7 @@ extern void skipmt(void);
 #define MINO_HEIGHT  4
 
 /* 落下スピード (20tick = 1.0秒) */
-#define DROP_INTERVAL 1000
+#define DROP_INTERVAL 20
 
 /* VT100 エスケープシーケンス */
 #define ESC_CLS      "\x1b[2J"
@@ -63,19 +63,19 @@ extern void skipmt(void);
 #define COL_WALL     COL_WHITE
 
 /* -------------------------------------------------------------------
- * イベント定義 (Theme 3: Event-Driven)
+ * イベント定義
  * ------------------------------------------------------------------- */
 typedef enum {
     EVT_NONE,
-    EVT_KEY_INPUT,  /* キー入力があった */
-    EVT_TIMER,      /* 自然落下の時間が来た */
-    EVT_WIN,        /* 勝利条件を満たした */
-    EVT_QUIT        /* 終了操作 */
+    EVT_KEY_INPUT,
+    EVT_TIMER,
+    EVT_WIN,
+    EVT_QUIT
 } EventType;
 
 typedef struct {
     EventType type;
-    int param;      /* キーコードなどの付加情報 */
+    int param;
 } Event;
 
 /* -------------------------------------------------------------------
@@ -99,6 +99,9 @@ typedef struct {
     int bag_index;
 
     unsigned long next_drop_time;
+    
+    /* 入力解析用ステートマシン */
+    int seq_state;  /* 0=通常, 1=ESC受信, 2=[受信 */
     
     int score;
     int lines_cleared;
@@ -399,17 +402,14 @@ int processGarbage(TetrisGame *game) {
     game->pending_garbage -= lines;
 
     int i, j, k;
-    /* 1. 上部チェック */
     for (k = 0; k < lines; k++) {
         for (j = 1; j < FIELD_WIDTH - 1; j++) {
             if (game->field[k][j] != 0) return 1; 
         }
     }
-    /* 2. シフト (床残し) */
     for (i = 0; i < FIELD_HEIGHT - 1 - lines; i++) {
         memcpy(game->field[i], game->field[i + lines], FIELD_WIDTH);
     }
-    /* 3. ゴミ生成 (床残し) */
     for (i = FIELD_HEIGHT - 1 - lines; i < FIELD_HEIGHT - 1; i++) {
         game->field[i][0] = 1;
         game->field[i][FIELD_WIDTH - 1] = 1;
@@ -445,8 +445,7 @@ void show_victory_message(TetrisGame *game) {
 
 /* -------------------------------------------------------------------
  * wait_event
- * イベント駆動の中核関数
- * イベントが発生するまで待ち続け(skipmt)，発生したらイベントを返す
+ * イベントディスパッチャ (矢印キー対応版)
  * ------------------------------------------------------------------- */
 Event wait_event(TetrisGame *game) {
     Event e;
@@ -454,51 +453,85 @@ Event wait_event(TetrisGame *game) {
     int c;
     int opponent_id = (game->port_id == 0) ? 1 : 0;
 
-    /* イベント待機ループ */
     while (1) {
         
-        /* 1. 優先イベント: 勝利判定 (相手の死亡) */
+        /* 1. 優先イベント: 勝利判定 */
         if (all_games[opponent_id] != NULL && all_games[opponent_id]->is_gameover) {
             e.type = EVT_WIN;
             return e;
         }
 
-        /* 2. 入力イベント: ノンブロッキング入力チェック */
+        /* 2. 入力イベント (シーケンス処理付き) */
         c = inbyte(game->port_id);
         if (c != -1) {
-            if (c == 'q') e.type = EVT_QUIT;
-            else {
-                e.type = EVT_KEY_INPUT;
-                e.param = c;
+            
+            /* --- エスケープシーケンス処理 (矢印キー対応) --- */
+            if (game->seq_state == 0) {
+                if (c == 0x1b) {
+                    game->seq_state = 1; /* ESC受信: 警戒モードへ */
+                } else {
+                    /* 通常キー */
+                    if (c == 'q') e.type = EVT_QUIT;
+                    else {
+                        e.type = EVT_KEY_INPUT;
+                        e.param = c;
+                    }
+                    return e;
+                }
+            } 
+            else if (game->seq_state == 1) {
+                if (c == '[') {
+                    game->seq_state = 2; /* [受信: 次の文字で判定 */
+                } else {
+                    game->seq_state = 0; /* 不正なシーケンス: リセット */
+                }
+            } 
+            else if (game->seq_state == 2) {
+                game->seq_state = 0; /* 完了: リセット */
+                /* 矢印キーをWASDにマッピング */
+                switch (c) {
+                    case 'A': e.param = 'w'; break; /* 上 -> w (回転) */
+                    case 'B': e.param = 's'; break; /* 下 -> s */
+                    case 'C': e.param = 'd'; break; /* 右 -> d */
+                    case 'D': e.param = 'a'; break; /* 左 -> a */
+                    default:  e.param = 0;   break;
+                }
+                if (e.param != 0) {
+                    e.type = EVT_KEY_INPUT;
+                    return e;
+                }
             }
-            return e;
+        } 
+        else {
+            /* 3. タイマーイベント (入力がないときのみチェック) */
+            /* * 入力シーケンス待機中 (state!=0) にタイマーで抜けると
+             * シーケンス処理が途切れる可能性があるが、
+             * 人間の操作速度ならタイマーより十分速いと仮定 
+             */
+            if (tick >= game->next_drop_time) {
+                game->next_drop_time = tick + DROP_INTERVAL; 
+                e.type = EVT_TIMER;
+                return e;
+            }
+            
+            /* イベントなし: CPU譲渡 */
+            skipmt();
         }
-
-        /* 3. タイマーイベント: 自然落下時刻のチェック */
-        if (tick >= game->next_drop_time) {
-            /* 次回の時間を設定し，イベント発行 */
-            game->next_drop_time = tick + DROP_INTERVAL; 
-            e.type = EVT_TIMER;
-            return e;
-        }
-
-        /* 4. イベントがない場合はCPUを譲渡して待機 (ビジーループ回避) */
-        skipmt();
     }
 }
 
 /* -------------------------------------------------------------------
- * ゲームロジック (イベントループ化)
+ * ゲームロジック
  * ------------------------------------------------------------------- */
 void run_tetris(TetrisGame *game) {
     int i, j;
     
-    /* 初期化 */
     game->score = 0;
     game->lines_cleared = 0;
     game->pending_garbage = 0;
     game->is_gameover = 0;
     game->force_refresh = 1;
+    game->seq_state = 0; /* ステート初期化 */
     memset(game->prevBuffer, 0, sizeof(game->prevBuffer));
     game->bag_index = 7;
 
@@ -516,12 +549,9 @@ void run_tetris(TetrisGame *game) {
     display(game);
     game->next_drop_time = tick + DROP_INTERVAL;
 
-    /* --- メインイベントループ --- */
     while (1) {
-        /* イベントの取得 (発生するまで戻らない) */
         Event e = wait_event(game);
 
-        /* イベントに応じた処理 (Switch Dispatch) */
         switch (e.type) {
             case EVT_WIN:
                 show_victory_message(game);
@@ -532,25 +562,25 @@ void run_tetris(TetrisGame *game) {
                 return;
 
             case EVT_KEY_INPUT:
-                /* キー操作処理 */
                 switch (e.param) {
-                    case 's':
+                    case 's': /* 下 (s または ↓) */
                         if (!isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
                             game->minoY++;
-                            game->next_drop_time = tick + DROP_INTERVAL; /* タイマー延長 */
+                            game->next_drop_time = tick + DROP_INTERVAL;
                         }
                         break;
-                    case 'a':
+                    case 'a': /* 左 (a または ←) */
                         if (!isHit(game, game->minoX - 1, game->minoY, game->minoType, game->minoAngle)) {
                             game->minoX--;
                         }
                         break;
-                    case 'd':
+                    case 'd': /* 右 (d または →) */
                         if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, game->minoAngle)) {
                             game->minoX++;
                         }
                         break;
-                    case ' ':
+                    case ' ': /* 回転 (Space) */
+                    case 'w': /* 回転 (w または ↑) */
                         if (!isHit(game, game->minoX, game->minoY, game->minoType, (game->minoAngle + 1) % MINO_ANGLE_MAX)) {
                             game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
                         }
@@ -560,11 +590,8 @@ void run_tetris(TetrisGame *game) {
                 break;
 
             case EVT_TIMER:
-                /* 自然落下処理 */
                 if (isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
-                    /* 固定・消去・攻撃・生成・判定など一連の更新処理 */
-                    
-                    /* 1. 固定 */
+                    /* 固定 */
                     for (i = 0; i < MINO_HEIGHT; i++) {
                         for (j = 0; j < MINO_WIDTH; j++) {
                             if (minoShapes[game->minoType][game->minoAngle][i][j]) {
@@ -575,8 +602,7 @@ void run_tetris(TetrisGame *game) {
                             }
                         }
                     }
-                    
-                    /* 2. 消去 & 攻撃 */
+                    /* 消去 & 攻撃 */
                     {
                         int lines_this_turn = 0;
                         for (i = 0; i < FIELD_HEIGHT - 1; i++) {
@@ -592,16 +618,13 @@ void run_tetris(TetrisGame *game) {
                                 lines_this_turn++;
                             }
                         }
-
                         if (lines_this_turn > 0) {
                             game->lines_cleared += lines_this_turn;
                             game->force_refresh = 1;
-                            
                             int attack = 0;
                             if (lines_this_turn == 2) attack = 1;
                             if (lines_this_turn == 3) attack = 2;
                             if (lines_this_turn == 4) attack = 4;
-                            
                             if (attack > 0) {
                                 int opponent_id = (game->port_id == 0) ? 1 : 0;
                                 if (all_games[opponent_id] != NULL && !all_games[opponent_id]->is_gameover) {
@@ -616,26 +639,19 @@ void run_tetris(TetrisGame *game) {
                             }
                         }
                     }
-                    
-                    /* 3. お邪魔せり上がり */
+                    /* せり上がり */
                     if (processGarbage(game)) {
                         game->is_gameover = 1;
                         show_gameover_message(game);
                         return;
                     }
-
-                    /* 4. 次のミノ生成 */
                     resetMino(game);
-                    
-                    /* 5. 窒息判定 */
                     if (isHit(game, game->minoX, game->minoY, game->minoType, game->minoAngle)) {
                         game->is_gameover = 1;
                         show_gameover_message(game);
                         return; 
                     }
-                    
                 } else {
-                    /* 移動可能なら下へ */
                     game->minoY++;
                 }
                 display(game);
@@ -655,7 +671,6 @@ void task1(void) {
     game1.port_id = 0;
     game1.fp_out = com0out;
     all_games[0] = &game1; 
-    
     while(1) {
         run_tetris(&game1);
         int i;
@@ -668,7 +683,6 @@ void task2(void) {
     game2.port_id = 1;
     game2.fp_out = com1out;
     all_games[1] = &game2;
-    
     while(1) {
         run_tetris(&game2);
         int i;
