@@ -2,9 +2,8 @@
  * tetris_main.c
  * テーマ3対応: イベント駆動型マルチタスク
  * 修正版: 
- * 1. 描画最適化 (行単位インターリーブ) -> 左右同時描画の実現
- * 2. ノンブロッキングアニメーション -> ライン消去時のフリーズ解消
- * 3. 通信量削減 -> 動作の軽量化
+ * 1. 起動時の乱数固定化問題を修正 (wait_start関数の追加)
+ * 2. 描画最適化 & ノンブロッキングアニメーション (維持)
  * =================================================================== */
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +27,9 @@ extern void begin_sch(void);
 extern int inbyte(int ch);
 extern void skipmt(void);
 
+/* tick は mtk_c.c で定義されているタイマーカウンタ (extern宣言が必要) */
+extern volatile unsigned long tick; 
+
 /* -------------------------------------------------------------------
  * 定数・マクロ
  * ------------------------------------------------------------------- */
@@ -45,7 +47,7 @@ extern void skipmt(void);
 /* アニメーションの長さ (tick) */
 #define ANIMATION_DURATION 50
 
-/* 画面更新の間引き (重さ対策: ループ何回に1回描画チェックするか) */
+/* 画面更新の間引き (重さ対策) */
 #define DISPLAY_POLL_INTERVAL 50
 
 /* VT100 エスケープシーケンス */
@@ -78,7 +80,7 @@ extern void skipmt(void);
  * ------------------------------------------------------------------- */
 typedef enum {
     GS_PLAYING,     /* 通常プレイ中 */
-    GS_ANIMATING,   /* ライン消去演出中 (操作不能・ノンブロッキング) */
+    GS_ANIMATING,   /* ライン消去演出中 */
     GS_GAMEOVER     /* ゲームオーバー */
 } GameState;
 
@@ -103,21 +105,17 @@ typedef struct {
     int port_id;
     FILE *fp_out;
     
-    /* 盤面データ */
     char field[FIELD_HEIGHT][FIELD_WIDTH];
-    
-    /* 描画用バッファ */
     char displayBuffer[FIELD_HEIGHT][FIELD_WIDTH];
     char prevBuffer[FIELD_HEIGHT][FIELD_WIDTH];
     
-    /* 相手画面の差分描画用バッファ */
     char prevOpponentBuffer[FIELD_HEIGHT][FIELD_WIDTH]; 
     int opponent_was_connected;
 
-    /* 現在のゲーム状態 (ステートマシン用) */
+    /* 現在のゲーム状態 */
     GameState state;
-    unsigned long anim_start_tick; /* アニメーション開始時刻 */
-    int lines_to_clear;            /* 消去待ちのライン数 */
+    unsigned long anim_start_tick;
+    int lines_to_clear;
 
     /* ミノ情報 */
     int minoType;
@@ -137,9 +135,7 @@ typedef struct {
     int score;
     int lines_cleared;
     
-    /* 相手から送られたお邪魔段数 (volatile: 相手タスクから書き込まれる) */
     volatile int pending_garbage;
-    
     volatile int is_gameover;
 
     /* リトライ同期用 */
@@ -352,19 +348,8 @@ char minoShapes[MINO_TYPE_MAX][MINO_ANGLE_MAX][MINO_HEIGHT][MINO_WIDTH] = {
 };
 
 /* -------------------------------------------------------------------
- * 関数プロトタイプ
+ * 描画ヘルパー関数
  * ------------------------------------------------------------------- */
-int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngle);
-void resetMino(TetrisGame *game);
-int processGarbage(TetrisGame *game);
-void show_gameover_message(TetrisGame *game);
-void wait_retry(TetrisGame *game);
-
-/* -------------------------------------------------------------------
- * 描画関連関数
- * ------------------------------------------------------------------- */
-
-/* 1セルの描画文字列を出力する（カーソル移動なし） */
 void print_cell_content(FILE *fp, char cellVal) {
     if (cellVal == 0) {
         fprintf(fp, "%s・%s", BG_BLACK, ESC_RESET);
@@ -377,12 +362,9 @@ void print_cell_content(FILE *fp, char cellVal) {
     }
 }
 
-/*
+/* -------------------------------------------------------------------
  * display: 画面描画関数 (最適化版)
- * 行ごとに、自分と相手の更新分をまとめて処理することで、
- * カーソル移動(エスケープシーケンス)のオーバーヘッドを削減し、
- * 左右の描画タイミングのズレを解消する。
- */
+ * ------------------------------------------------------------------- */
 void display(TetrisGame *game) {
     int i, j;
     int changes = 0;
@@ -390,14 +372,12 @@ void display(TetrisGame *game) {
     int opponent_id = (game->port_id == 0) ? 1 : 0;
     TetrisGame *opponent = all_games[opponent_id];
 
-    /* 相手接続時の初期化 */
     int opponent_connected = (opponent != NULL);
     if (opponent_connected && !game->opponent_was_connected) {
         memset(game->prevOpponentBuffer, -1, sizeof(game->prevOpponentBuffer));
     }
     game->opponent_was_connected = opponent_connected;
 
-    /* 自分のバッファ更新 */
     memcpy(game->displayBuffer, game->field, sizeof(game->field));
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
@@ -411,7 +391,6 @@ void display(TetrisGame *game) {
         }
     }
 
-    /* ヘッダー情報（ここは毎回更新してもデータ量が少ないのでOK） */
     fprintf(game->fp_out, "\x1b[1;1H");
     fprintf(game->fp_out, "[YOU] SC:%-5d LN:%-3d ATK:%d", 
             game->score, game->lines_cleared, game->pending_garbage);
@@ -426,15 +405,20 @@ void display(TetrisGame *game) {
     }
     fprintf(game->fp_out, "%s", ESC_CLR_LINE);
 
-    /* --- 盤面描画（行単位でインターリーブ） --- */
+    fprintf(game->fp_out, "\n--------------------------");
+    if (opponent != NULL) {
+        fprintf(game->fp_out, "\x1b[2;%dH", OPPONENT_OFFSET_X);
+        fprintf(game->fp_out, "--------------------------");
+    }
+    fprintf(game->fp_out, "%s", ESC_CLR_LINE);
+
     int base_y = 3;
 
     for (i = 0; i < FIELD_HEIGHT; i++) {
-        /* この行で、自分のフィールドに変化があるか？ */
+        /* 左側: 自分 */
         for (j = 0; j < FIELD_WIDTH; j++) {
             char myVal = game->displayBuffer[i][j];
             if (myVal != game->prevBuffer[i][j]) {
-                /* カーソル移動して描画 */
                 fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, j * 2 + 1);
                 print_cell_content(game->fp_out, myVal);
                 game->prevBuffer[i][j] = myVal;
@@ -442,12 +426,11 @@ void display(TetrisGame *game) {
             }
         }
 
-        /* 同じ行で、相手のフィールドに変化があるか？ */
+        /* 右側: 相手 */
         if (opponent != NULL) {
             for (j = 0; j < FIELD_WIDTH; j++) {
                 char oppVal = opponent->displayBuffer[i][j];
                 if (oppVal != game->prevOpponentBuffer[i][j]) {
-                    /* カーソル移動（右側のオフセット位置へ） */
                     fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, OPPONENT_OFFSET_X + j * 2);
                     print_cell_content(game->fp_out, oppVal);
                     game->prevOpponentBuffer[i][j] = oppVal;
@@ -461,7 +444,7 @@ void display(TetrisGame *game) {
 }
 
 /* -------------------------------------------------------------------
- * イベント処理関数
+ * wait_event: イベント処理
  * ------------------------------------------------------------------- */
 Event wait_event(TetrisGame *game) {
     Event e;
@@ -471,16 +454,11 @@ Event wait_event(TetrisGame *game) {
     static int poll_counter = 0;
 
     while (1) {
-        /* 勝利判定 */
         if (all_games[opponent_id] != NULL && all_games[opponent_id]->is_gameover) {
             e.type = EVT_WIN;
             return e;
         }
 
-        /* アニメーション中は入力やタイマーを無視して、アニメ終了判定のみ行う */
-        /* -> 呼び出し元で処理するため、ここでは通常通り返す */
-
-        /* 入力チェック */
         c = inbyte(game->port_id);
         if (c != -1) {
             if (game->seq_state == 0) {
@@ -505,21 +483,17 @@ Event wait_event(TetrisGame *game) {
             }
         } 
         else {
-            /* 時間経過チェック */
             if (tick >= game->next_drop_time) {
                 e.type = EVT_TIMER;
                 return e;
             }
             
-            /* 画面更新 (間引き処理) */
             poll_counter++;
             if (poll_counter >= DISPLAY_POLL_INTERVAL) {
-                display(game); /* 相手画面の更新もここで行われる */
+                display(game); 
                 poll_counter = 0;
                 
-                /* アニメーション中ならここですぐリターンせず、状態チェックさせる */
                 if (game->state == GS_ANIMATING) {
-                    /* 何もイベントがなくても、アニメ終了判定のために定期的に戻る必要がある */
                     e.type = EVT_NONE; 
                     return e; 
                 }
@@ -531,206 +505,7 @@ Event wait_event(TetrisGame *game) {
 }
 
 /* -------------------------------------------------------------------
- * ゲームロジック (ステートマシン導入)
- * ------------------------------------------------------------------- */
-void run_tetris(TetrisGame *game) {
-    int i, j;
-    
-    /* 初期化 */
-    game->score = 0;
-    game->lines_cleared = 0;
-    game->pending_garbage = 0;
-    game->is_gameover = 0;
-    game->state = GS_PLAYING; /* 初期状態 */
-    game->lines_to_clear = 0;
-    
-    game->seq_state = 0;
-    game->opponent_was_connected = 0;
-    
-    memset(game->prevBuffer, -1, sizeof(game->prevBuffer));
-    memset(game->prevOpponentBuffer, -1, sizeof(game->prevOpponentBuffer));
-    
-    game->bag_index = 7;
-
-    fprintf(game->fp_out, ESC_CLS ESC_HIDE_CUR); 
-    
-    memset(game->field, 0, sizeof(game->field));
-    for (i = 0; i < FIELD_HEIGHT; i++) {
-        game->field[i][0] = game->field[i][FIELD_WIDTH - 1] = 1;
-    }
-    for (i = 0; i < FIELD_WIDTH; i++) {
-        game->field[FIELD_HEIGHT - 1][i] = 1;
-    }
-
-    resetMino(game);
-    display(game);
-    game->next_drop_time = tick + DROP_INTERVAL;
-
-    /* メインループ */
-    while (1) {
-        Event e = wait_event(game);
-
-        /* --- 1. アニメーション中の処理 --- */
-        if (game->state == GS_ANIMATING) {
-            /* アニメーション期間が終了したかチェック */
-            if (tick >= game->anim_start_tick + ANIMATION_DURATION) {
-                /* アニメ終了処理 */
-                fprintf(game->fp_out, ESC_INVERT_OFF); /* 反転解除 */
-                
-                /* ライン消去と攻撃処理の実行 */
-                game->lines_cleared += game->lines_to_clear;
-                
-                int attack = 0;
-                /* テスト用: 1列でも攻撃 (適宜変更可) */
-                if (game->lines_to_clear == 1) attack = 1;
-                if (game->lines_to_clear == 2) attack = 1;
-                if (game->lines_to_clear == 3) attack = 2;
-                if (game->lines_to_clear == 4) attack = 4;
-                
-                if (attack > 0) {
-                    int opponent_id = (game->port_id == 0) ? 1 : 0;
-                    if (all_games[opponent_id] != NULL && !all_games[opponent_id]->is_gameover) {
-                        all_games[opponent_id]->pending_garbage += attack;
-                    }
-                }
-                
-                switch (game->lines_to_clear) {
-                    case 1: game->score += 100; break;
-                    case 2: game->score += 300; break;
-                    case 3: game->score += 500; break;
-                    case 4: game->score += 800; break;
-                }
-
-                /* 状態をプレイ中に戻す */
-                game->state = GS_PLAYING;
-                game->next_drop_time = tick + DROP_INTERVAL; /* 落下タイマー再開 */
-                
-                /* お邪魔処理へ移行 */
-                goto PROCESS_GARBAGE;
-            }
-            continue; /* アニメ中は入力を無視 */
-        }
-
-        /* --- 2. 通常プレイ中の処理 --- */
-        switch (e.type) {
-            case EVT_WIN:
-                show_victory_message(game);
-                wait_retry(game); 
-                return; 
-
-            case EVT_QUIT:
-                fprintf(game->fp_out, "%sQuit.\n", ESC_SHOW_CUR);
-                wait_retry(game);
-                return;
-
-            case EVT_KEY_INPUT:
-                switch (e.param) {
-                    case 's':
-                        if (!isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
-                            game->minoY++;
-                            game->next_drop_time = tick + DROP_INTERVAL;
-                        }
-                        break;
-                    case 'a':
-                        if (!isHit(game, game->minoX - 1, game->minoY, game->minoType, game->minoAngle)) game->minoX--;
-                        break;
-                    case 'd':
-                        if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, game->minoAngle)) game->minoX++;
-                        break;
-                    case ' ':
-                    case 'w':
-                        if (!isHit(game, game->minoX, game->minoY, game->minoType, (game->minoAngle + 1) % MINO_ANGLE_MAX)) {
-                            game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
-                        }
-                        break;
-                }
-                display(game);
-                break;
-
-            case EVT_TIMER:
-                /* 自然落下処理 */
-                if (isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
-                    /* 固定処理 */
-                    for (i = 0; i < MINO_HEIGHT; i++) {
-                        for (j = 0; j < MINO_WIDTH; j++) {
-                            if (minoShapes[game->minoType][game->minoAngle][i][j]) {
-                                if (game->minoY + i >= 0 && game->minoY + i < FIELD_HEIGHT &&
-                                    game->minoX + j >= 0 && game->minoX + j < FIELD_WIDTH) {
-                                    game->field[game->minoY + i][game->minoX + j] = 2 + game->minoType;
-                                }
-                            }
-                        }
-                    }
-                    
-                    /* ライン消去チェック */
-                    int lines_this_turn = 0;
-                    for (i = 0; i < FIELD_HEIGHT - 1; i++) {
-                        int lineFill = 1;
-                        for (j = 1; j < FIELD_WIDTH - 1; j++) {
-                            if (game->field[i][j] == 0) { lineFill = 0; break; }
-                        }
-                        if (lineFill) {
-                            int k;
-                            for (k = i; k > 0; k--) memcpy(game->field[k], game->field[k - 1], FIELD_WIDTH);
-                            memset(game->field[0], 0, FIELD_WIDTH);
-                            game->field[0][0] = game->field[0][FIELD_WIDTH-1] = 1;
-                            lines_this_turn++;
-                        }
-                    }
-
-                    if (lines_this_turn > 0) {
-                        /* アニメーション開始 (ノンブロッキング) */
-                        fprintf(game->fp_out, "\a" ESC_INVERT_ON); /* 音+反転 */
-                        fflush(game->fp_out);
-                        
-                        game->state = GS_ANIMATING;
-                        game->anim_start_tick = tick;
-                        game->lines_to_clear = lines_this_turn;
-                        
-                        /* 次のループへ (アニメ終了を待つ) */
-                        break; 
-                    }
-
-                PROCESS_GARBAGE:
-                    /* お邪魔ブロックのせり上がり */
-                    if (processGarbage(game)) {
-                        game->is_gameover = 1;
-                        fprintf(game->fp_out, "\a");
-                        show_gameover_message(game);
-                        wait_retry(game); 
-                        return;
-                    }
-                    
-                    /* 次のミノ */
-                    resetMino(game);
-                    
-                    /* 窒息判定 */
-                    if (isHit(game, game->minoX, game->minoY, game->minoType, game->minoAngle)) {
-                        game->is_gameover = 1;
-                        fprintf(game->fp_out, "\a");
-                        show_gameover_message(game);
-                        wait_retry(game); 
-                        return; 
-                    }
-                    
-                    /* 更新: next_drop_time はリセット */
-                    game->next_drop_time = tick + DROP_INTERVAL;
-
-                } else {
-                    game->minoY++;
-                    game->next_drop_time = tick + DROP_INTERVAL;
-                }
-                display(game);
-                break;
-                
-            default:
-                break;
-        }
-    }
-}
-
-/* -------------------------------------------------------------------
- * その他関数
+ * 各種ロジック関数
  * ------------------------------------------------------------------- */
 int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngle) {
     int i, j;
@@ -750,6 +525,7 @@ int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngl
 void fillBag(TetrisGame *game) {
     int i, j, temp;
     for (i = 0; i < 7; i++) game->bag[i] = i;
+    /* tickを使ったシャッフル (起動直後の固定化対策済み) */
     for (i = 6; i > 0; i--) {
         j = (tick + rand()) % (i + 1); 
         temp = game->bag[i]; game->bag[i] = game->bag[j]; game->bag[j] = temp;
@@ -793,6 +569,48 @@ int processGarbage(TetrisGame *game) {
     return 0; 
 }
 
+/* -------------------------------------------------------------------
+ * 同期処理関数 (修正版)
+ * ------------------------------------------------------------------- */
+
+/* ★修正: ゲーム開始前の同期と乱数初期化 */
+void wait_start(TetrisGame *game) {
+    int opponent_id = (game->port_id == 0) ? 1 : 0;
+
+    fprintf(game->fp_out, ESC_CLS ESC_HOME);
+    fprintf(game->fp_out, "============================\n");
+    fprintf(game->fp_out, "   TETRIS: 2-PLAYER BATTLE  \n");
+    fprintf(game->fp_out, "============================\n");
+    fprintf(game->fp_out, "\nPress Any Key to Start...\n");
+    fflush(game->fp_out);
+
+    /* 1. キー入力待ち (人間が押すまで待機) */
+    while (1) {
+        int c = inbyte(game->port_id);
+        if (c != -1) break; 
+        skipmt();
+    }
+
+    /* 2. 乱数初期化: 押された瞬間の tick をシードにする */
+    /* これにより、起動直後でも毎回異なるミノ順序になる */
+    srand((unsigned int)tick);
+
+    /* 3. 開始同期 */
+    game->sync_generation++;
+    fprintf(game->fp_out, ESC_CLR_LINE);
+    fprintf(game->fp_out, "\rWaiting for opponent...   \n");
+    fflush(game->fp_out);
+
+    while (1) {
+        if (all_games[opponent_id] != NULL) {
+            if (all_games[opponent_id]->sync_generation == game->sync_generation) break;
+        } else {
+            break; /* 相手がいなければ待たない */
+        }
+        skipmt();
+    }
+}
+
 void wait_retry(TetrisGame *game) {
     int opponent_id = (game->port_id == 0) ? 1 : 0;
     fprintf(game->fp_out, "\nPress 'R' to Retry...\n");
@@ -802,6 +620,9 @@ void wait_retry(TetrisGame *game) {
         if (c == 'r' || c == 'R') break; 
         skipmt();
     }
+    /* リトライ時も念のため乱数を混ぜる */
+    srand((unsigned int)tick + rand());
+
     game->sync_generation++;
     fprintf(game->fp_out, ESC_CLR_LINE);
     fprintf(game->fp_out, "\rWaiting for opponent...   \n");
@@ -835,6 +656,183 @@ void show_victory_message(TetrisGame *game) {
 }
 
 /* -------------------------------------------------------------------
+ * ゲームロジック本体
+ * ------------------------------------------------------------------- */
+void run_tetris(TetrisGame *game) {
+    int i, j;
+    
+    game->score = 0;
+    game->lines_cleared = 0;
+    game->pending_garbage = 0;
+    game->is_gameover = 0;
+    game->state = GS_PLAYING; 
+    game->lines_to_clear = 0;
+    
+    game->seq_state = 0;
+    game->opponent_was_connected = 0;
+    
+    memset(game->prevBuffer, -1, sizeof(game->prevBuffer));
+    memset(game->prevOpponentBuffer, -1, sizeof(game->prevOpponentBuffer));
+    
+    game->bag_index = 7;
+
+    fprintf(game->fp_out, ESC_CLS ESC_HIDE_CUR); 
+    
+    memset(game->field, 0, sizeof(game->field));
+    for (i = 0; i < FIELD_HEIGHT; i++) {
+        game->field[i][0] = game->field[i][FIELD_WIDTH - 1] = 1;
+    }
+    for (i = 0; i < FIELD_WIDTH; i++) {
+        game->field[FIELD_HEIGHT - 1][i] = 1;
+    }
+
+    resetMino(game);
+    display(game);
+    game->next_drop_time = tick + DROP_INTERVAL;
+
+    while (1) {
+        Event e = wait_event(game);
+
+        if (game->state == GS_ANIMATING) {
+            if (tick >= game->anim_start_tick + ANIMATION_DURATION) {
+                fprintf(game->fp_out, ESC_INVERT_OFF); 
+                
+                game->lines_cleared += game->lines_to_clear;
+                
+                int attack = 0;
+                if (game->lines_to_clear == 1) attack = 1;
+                if (game->lines_to_clear == 2) attack = 1;
+                if (game->lines_to_clear == 3) attack = 2;
+                if (game->lines_to_clear == 4) attack = 4;
+                
+                if (attack > 0) {
+                    int opponent_id = (game->port_id == 0) ? 1 : 0;
+                    if (all_games[opponent_id] != NULL && !all_games[opponent_id]->is_gameover) {
+                        all_games[opponent_id]->pending_garbage += attack;
+                    }
+                }
+                
+                switch (game->lines_to_clear) {
+                    case 1: game->score += 100; break;
+                    case 2: game->score += 300; break;
+                    case 3: game->score += 500; break;
+                    case 4: game->score += 800; break;
+                }
+
+                game->state = GS_PLAYING;
+                game->next_drop_time = tick + DROP_INTERVAL; 
+                
+                goto PROCESS_GARBAGE;
+            }
+            continue; 
+        }
+
+        switch (e.type) {
+            case EVT_WIN:
+                show_victory_message(game);
+                wait_retry(game); 
+                return; 
+
+            case EVT_QUIT:
+                fprintf(game->fp_out, "%sQuit.\n", ESC_SHOW_CUR);
+                wait_retry(game);
+                return;
+
+            case EVT_KEY_INPUT:
+                switch (e.param) {
+                    case 's':
+                        if (!isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
+                            game->minoY++;
+                            game->next_drop_time = tick + DROP_INTERVAL;
+                        }
+                        break;
+                    case 'a':
+                        if (!isHit(game, game->minoX - 1, game->minoY, game->minoType, game->minoAngle)) game->minoX--;
+                        break;
+                    case 'd':
+                        if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, game->minoAngle)) game->minoX++;
+                        break;
+                    case ' ':
+                    case 'w':
+                        if (!isHit(game, game->minoX, game->minoY, game->minoType, (game->minoAngle + 1) % MINO_ANGLE_MAX)) {
+                            game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
+                        }
+                        break;
+                }
+                display(game);
+                break;
+
+            case EVT_TIMER:
+                if (isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
+                    for (i = 0; i < MINO_HEIGHT; i++) {
+                        for (j = 0; j < MINO_WIDTH; j++) {
+                            if (minoShapes[game->minoType][game->minoAngle][i][j]) {
+                                if (game->minoY + i >= 0 && game->minoY + i < FIELD_HEIGHT &&
+                                    game->minoX + j >= 0 && game->minoX + j < FIELD_WIDTH) {
+                                    game->field[game->minoY + i][game->minoX + j] = 2 + game->minoType;
+                                }
+                            }
+                        }
+                    }
+                    
+                    int lines_this_turn = 0;
+                    for (i = 0; i < FIELD_HEIGHT - 1; i++) {
+                        int lineFill = 1;
+                        for (j = 1; j < FIELD_WIDTH - 1; j++) {
+                            if (game->field[i][j] == 0) { lineFill = 0; break; }
+                        }
+                        if (lineFill) {
+                            int k;
+                            for (k = i; k > 0; k--) memcpy(game->field[k], game->field[k - 1], FIELD_WIDTH);
+                            memset(game->field[0], 0, FIELD_WIDTH);
+                            game->field[0][0] = game->field[0][FIELD_WIDTH-1] = 1;
+                            lines_this_turn++;
+                        }
+                    }
+
+                    if (lines_this_turn > 0) {
+                        fprintf(game->fp_out, "\a" ESC_INVERT_ON); 
+                        fflush(game->fp_out);
+                        game->state = GS_ANIMATING;
+                        game->anim_start_tick = tick;
+                        game->lines_to_clear = lines_this_turn;
+                        break; 
+                    }
+
+                PROCESS_GARBAGE:
+                    if (processGarbage(game)) {
+                        game->is_gameover = 1;
+                        fprintf(game->fp_out, "\a");
+                        show_gameover_message(game);
+                        wait_retry(game); 
+                        return;
+                    }
+                    
+                    resetMino(game);
+                    
+                    if (isHit(game, game->minoX, game->minoY, game->minoType, game->minoAngle)) {
+                        game->is_gameover = 1;
+                        fprintf(game->fp_out, "\a");
+                        show_gameover_message(game);
+                        wait_retry(game); 
+                        return; 
+                    }
+                    game->next_drop_time = tick + DROP_INTERVAL;
+
+                } else {
+                    game->minoY++;
+                    game->next_drop_time = tick + DROP_INTERVAL;
+                }
+                display(game);
+                break;
+                
+            default:
+                break;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------
  * タスク群
  * ------------------------------------------------------------------- */
 void task1(void) {
@@ -843,7 +841,13 @@ void task1(void) {
     game1.fp_out = com0out;
     game1.sync_generation = 0;
     all_games[0] = &game1; 
-    while(1) run_tetris(&game1);
+    
+    /* 修正: ゲーム開始前の同期と乱数初期化 */
+    wait_start(&game1);
+
+    while(1) {
+        run_tetris(&game1);
+    }
 }
 
 void task2(void) {
@@ -852,7 +856,13 @@ void task2(void) {
     game2.fp_out = com1out;
     game2.sync_generation = 0;
     all_games[1] = &game2;
-    while(1) run_tetris(&game2);
+    
+    /* 修正: ゲーム開始前の同期と乱数初期化 */
+    wait_start(&game2);
+
+    while(1) {
+        run_tetris(&game2);
+    }
 }
 
 /* -------------------------------------------------------------------
