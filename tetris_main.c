@@ -648,11 +648,19 @@ void run_tetris(TetrisGame *game) {
                             }
                         }
                         if (lines_this_turn > 0) {
+                            /* ベル文字(\a) + 画面反転開始(\x1b[?5h) */
+                            fprintf(game->fp_out, "\a\x1b[?5h");
+                            fflush(game->fp_out); /* 即座に送信して画面を反転させる */
+                            int k;
+                            for(k = 0; k < 500; k++) skipmt(); 
+                            /* 画面反転解除(\x1b[?5l) */
+                            fprintf(game->fp_out, "\x1b[?5l");
                             game->lines_cleared += lines_this_turn;
                             game->force_refresh = 1;
                             int attack = 0;
-                            if (lines_this_turn == 2) attack = 1;
-                            if (lines_this_turn == 3) attack = 2;
+                            if (lines_this_turn == 1) attack = 1;
+                            if (lines_this_turn == 2) attack = 2;
+                            if (lines_this_turn == 3) attack = 3;
                             if (lines_this_turn == 4) attack = 4;
                             if (attack > 0) {
                                 int opponent_id = (game->port_id == 0) ? 1 : 0;
@@ -671,6 +679,7 @@ void run_tetris(TetrisGame *game) {
                     /* せり上がり */
                     if (processGarbage(game)) {
                         game->is_gameover = 1;
+                        fprintf(game->fp_out, "\a");
                         show_gameover_message(game);
                         wait_retry(game); 
                         return;
@@ -678,6 +687,7 @@ void run_tetris(TetrisGame *game) {
                     resetMino(game);
                     if (isHit(game, game->minoX, game->minoY, game->minoType, game->minoAngle)) {
                         game->is_gameover = 1;
+                        fprintf(game->fp_out, "\a");
                         show_gameover_message(game);
                         wait_retry(game); 
                         return; 
