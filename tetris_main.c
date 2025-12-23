@@ -9,6 +9,8 @@
  * - 差分更新による描画最適化 (通信量削減)
  * - ノンブロッキング入力と skipmt() による協調的マルチタスク
  * - 起動時・リトライ時の同期処理
+ * - [追加] NEXT表示機能
+ * - [追加] ハードドロップ実装
  * =================================================================== */
 
 #include <stdio.h>
@@ -48,9 +50,11 @@ extern volatile unsigned long tick;
 
 /* 画面レイアウト */
 #define OPPONENT_OFFSET_X 40    /* 相手画面の表示Xオフセット */
+#define NEXT_OFFSET_X     27    /* NEXT表示領域のXオフセット */
+#define NEXT_OFFSET_Y     4     /* NEXT表示領域のYオフセット */
 
 /* ゲームバランス設定 */
-#define DROP_INTERVAL 600     /* 自然落下の間隔 (tick単位) */
+#define DROP_INTERVAL 600      /* 自然落下の間隔 (tick単位) */
 #define ANIMATION_DURATION 3   /* ライン消去演出の時間 (tick単位) */
 
 /* システム設定 */
@@ -136,6 +140,10 @@ typedef struct {
     int minoX;      /* X座標 */
     int minoY;      /* Y座標 */
     
+    /* NEXTミノ情報 */
+    int nextMinoType;       /* 次に出現するミノの種類 */
+    int prevNextMinoType;   /* 前回描画したNEXTミノ (差分更新用) */
+
     /* ミノ生成 (7-Bag システム) */
     int bag[7];
     int bag_index;
@@ -180,198 +188,57 @@ enum { MINO_ANGLE_0, MINO_ANGLE_90, MINO_ANGLE_180, MINO_ANGLE_270, MINO_ANGLE_M
 /* * ミノ形状データ (4x4x4方向)
  * 1: ブロックあり， 0: 空白
  */
-/* ミノ形状データ (0/1) */
 char minoShapes[MINO_TYPE_MAX][MINO_ANGLE_MAX][MINO_HEIGHT][MINO_WIDTH] = {
     /* MINO_TYPE_I */
     {
-        {
-            {0, 1, 0, 0},
-            {0, 1, 0, 0},
-            {0, 1, 0, 0},
-            {0, 1, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 0, 0, 0},
-            {1, 1, 1, 1},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 1, 0},
-            {0, 0, 1, 0},
-            {0, 0, 1, 0},
-            {0, 0, 1, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {1, 1, 1, 1},
-            {0, 0, 0, 0},
-            {0, 0, 0, 0}
-        }
+        { {0, 1, 0, 0}, {0, 1, 0, 0}, {0, 1, 0, 0}, {0, 1, 0, 0} },
+        { {0, 0, 0, 0}, {0, 0, 0, 0}, {1, 1, 1, 1}, {0, 0, 0, 0} },
+        { {0, 0, 1, 0}, {0, 0, 1, 0}, {0, 0, 1, 0}, {0, 0, 1, 0} },
+        { {0, 0, 0, 0}, {1, 1, 1, 1}, {0, 0, 0, 0}, {0, 0, 0, 0} }
     },
     /* MINO_TYPE_O */
     {
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 0},
-            {0, 1, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 0},
-            {0, 1, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 0},
-            {0, 1, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 0},
-            {0, 1, 1, 0},
-            {0, 0, 0, 0}
-        }
+        { {0, 0, 0, 0}, {0, 1, 1, 0}, {0, 1, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 1, 0}, {0, 1, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 1, 0}, {0, 1, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 1, 0}, {0, 1, 1, 0}, {0, 0, 0, 0} }
     },
     /* MINO_TYPE_S */
     {
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 0},
-            {1, 1, 0, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 1, 0, 0},
-            {0, 1, 1, 0},
-            {0, 0, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 0, 1, 1},
-            {0, 1, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 0, 0},
-            {0, 1, 1, 0},
-            {0, 0, 1, 0}
-        }
+        { {0, 0, 0, 0}, {0, 1, 1, 0}, {1, 1, 0, 0}, {0, 0, 0, 0} },
+        { {0, 1, 0, 0}, {0, 1, 1, 0}, {0, 0, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 0, 1, 1}, {0, 1, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 0, 0}, {0, 1, 1, 0}, {0, 0, 1, 0} }
     },
     /* MINO_TYPE_Z */
     {
-        {
-            {0, 0, 0, 0},
-            {1, 1, 0, 0},
-            {0, 1, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 1, 0},
-            {0, 1, 1, 0},
-            {0, 1, 0, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 0},
-            {0, 0, 1, 1},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 0, 1, 0},
-            {0, 1, 1, 0},
-            {0, 1, 0, 0}
-        }
+        { {0, 0, 0, 0}, {1, 1, 0, 0}, {0, 1, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 1, 0}, {0, 1, 1, 0}, {0, 1, 0, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 1, 0}, {0, 0, 1, 1}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 0, 1, 0}, {0, 1, 1, 0}, {0, 1, 0, 0} }
     },
     /* MINO_TYPE_J */
     {
-        {
-            {0, 0, 1, 0},
-            {0, 0, 1, 0},
-            {0, 1, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 0, 0},
-            {0, 1, 1, 1},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 0},
-            {0, 1, 0, 0},
-            {0, 1, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {1, 1, 1, 0},
-            {0, 0, 1, 0},
-            {0, 0, 0, 0}
-        }
+        { {0, 0, 1, 0}, {0, 0, 1, 0}, {0, 1, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 0, 0}, {0, 1, 1, 1}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 1, 0}, {0, 1, 0, 0}, {0, 1, 0, 0} },
+        { {0, 0, 0, 0}, {1, 1, 1, 0}, {0, 0, 1, 0}, {0, 0, 0, 0} }
     },
     /* MINO_TYPE_L */
     {
-        {
-            {0, 1, 0, 0},
-            {0, 1, 0, 0},
-            {0, 1, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 1},
-            {0, 1, 0, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 1, 0},
-            {0, 0, 1, 0},
-            {0, 0, 1, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 0, 1, 0},
-            {1, 1, 1, 0},
-            {0, 0, 0, 0}
-        }
+        { {0, 1, 0, 0}, {0, 1, 0, 0}, {0, 1, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 1, 1}, {0, 1, 0, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 1, 0}, {0, 0, 1, 0}, {0, 0, 1, 0} },
+        { {0, 0, 0, 0}, {0, 0, 1, 0}, {1, 1, 1, 0}, {0, 0, 0, 0} }
     },
     /* MINO_TYPE_T */
     {
-        {
-            {0, 0, 0, 0},
-            {1, 1, 1, 0},
-            {0, 1, 0, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 1, 0},
-            {0, 1, 1, 0},
-            {0, 0, 1, 0},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 0, 1, 0},
-            {0, 1, 1, 1},
-            {0, 0, 0, 0}
-        },
-        {
-            {0, 0, 0, 0},
-            {0, 1, 0, 0},
-            {0, 1, 1, 0},
-            {0, 1, 0, 0}
-        }
+        { {0, 0, 0, 0}, {1, 1, 1, 0}, {0, 1, 0, 0}, {0, 0, 0, 0} },
+        { {0, 0, 1, 0}, {0, 1, 1, 0}, {0, 0, 1, 0}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 0, 1, 0}, {0, 1, 1, 1}, {0, 0, 0, 0} },
+        { {0, 0, 0, 0}, {0, 1, 0, 0}, {0, 1, 1, 0}, {0, 1, 0, 0} }
     },
-	/* MINO_TYPE_GARBAGE (形状定義なし) */
+    /* MINO_TYPE_GARBAGE (形状定義なし) */
     { {{0}},{{0}},{{0}},{{0}} }
 };
 
@@ -397,6 +264,43 @@ void print_cell_content(FILE *fp, char cellVal) {
         /* エラー表示 */
         fprintf(fp, "??");
     }
+}
+
+/* -------------------------------------------------------------------
+ * NEXTミノ描画関数
+ * 概要:
+ * フィールド右側に次のミノを表示する．
+ * prevNextMinoType を使用して，変化があったときのみ再描画する．
+ * ------------------------------------------------------------------- */
+void draw_next_window(TetrisGame *game) {
+    /* 変化がなければ描画しない */
+    if (game->nextMinoType == game->prevNextMinoType) return;
+
+    int i, j;
+    int next_type = game->nextMinoType;
+    int base_x = NEXT_OFFSET_X;
+    int base_y = NEXT_OFFSET_Y;
+
+    /* ラベルの描画 (初回または変更時) */
+    fprintf(game->fp_out, "\x1b[%d;%dH[NEXT]", base_y - 1, base_x);
+
+    /* NEXTエリアの描画 (4x4領域) */
+    for (i = 0; i < MINO_HEIGHT; i++) {
+        fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, base_x); /* カーソル移動 */
+        for (j = 0; j < MINO_WIDTH; j++) {
+            /* NEXTは回転角0で固定表示 */
+            if (minoShapes[next_type][MINO_ANGLE_0][i][j]) {
+                /* 色付きブロック */
+                fprintf(game->fp_out, "%s%s■%s", BG_BLACK, minoColors[next_type], ESC_RESET);
+            } else {
+                /* 背景 (空白) */
+                fprintf(game->fp_out, "%s  %s", BG_BLACK, ESC_RESET);
+            }
+        }
+    }
+    
+    /* 状態更新 */
+    game->prevNextMinoType = next_type;
 }
 
 /* -------------------------------------------------------------------
@@ -489,6 +393,9 @@ void display(TetrisGame *game) {
         }
     }
     
+    /* 4. NEXT表示の更新 */
+    draw_next_window(game);
+
     /* 変更があった場合のみバッファフラッシュ */
     if (changes > 0) fflush(game->fp_out);
 }
@@ -532,7 +439,7 @@ Event wait_event(TetrisGame *game) {
                 /* コマンド受信 */
                 game->seq_state = 0;
                 switch (c) {
-                    case 'A': e.param = 'w'; break; /* Up */
+                    case 'A': e.param = 'w'; break; /* Up -> 'w' (HardDropに割り当て予定) */
                     case 'B': e.param = 's'; break; /* Down */
                     case 'C': e.param = 'd'; break; /* Right */
                     case 'D': e.param = 'a'; break; /* Left */
@@ -602,14 +509,23 @@ void fillBag(TetrisGame *game) {
     game->bag_index = 0;
 }
 
-/* ミノのリセット・次生成 */
+/* ミノのリセット・次生成
+ * nextMinoType を現在ミノに昇格させ，新たなNEXTを生成する方式に変更
+ */
 void resetMino(TetrisGame *game) {
     game->minoX = 5;
     game->minoY = 0;
-    if (game->bag_index >= 7) fillBag(game);
-    game->minoType = game->bag[game->bag_index];
-    game->bag_index++;
+    
+    /* NEXTを現在ミノに昇格 */
+    game->minoType = game->nextMinoType;
+    
+    /* 現在ミノの回転角はランダム */
     game->minoAngle = (tick + rand()) % MINO_ANGLE_MAX;
+
+    /* 次のミノ(NEXT)を補充 */
+    if (game->bag_index >= 7) fillBag(game);
+    game->nextMinoType = game->bag[game->bag_index];
+    game->bag_index++;
 }
 
 /* お邪魔ライン(Garbage)のせり上がり処理 */
@@ -754,12 +670,11 @@ void run_tetris(TetrisGame *game) {
     
     game->seq_state = 0;
     game->opponent_was_connected = 0;
+    game->prevNextMinoType = -1; /* NEXT描画の強制更新用 */
     
     memset(game->prevBuffer, -1, sizeof(game->prevBuffer));
     memset(game->prevOpponentBuffer, -1, sizeof(game->prevOpponentBuffer));
     
-    game->bag_index = 7; /* 初回fillBagを強制 */
-
     fprintf(game->fp_out, ESC_CLS ESC_HIDE_CUR); 
     
     /* フィールド枠の初期化 */
@@ -771,7 +686,11 @@ void run_tetris(TetrisGame *game) {
         game->field[FIELD_HEIGHT - 1][i] = 1; /* 床 */
     }
 
-    resetMino(game);
+    /* --- 初期ミノセットアップ --- */
+    fillBag(game); /* 最初のバッグ生成 */
+    game->nextMinoType = game->bag[game->bag_index++]; /* 最初のNEXTを準備 */
+    resetMino(game); /* NEXTをCurrentに昇格させ，さらに次のNEXTを準備 */
+
     display(game);
     game->next_drop_time = tick + DROP_INTERVAL;
 
@@ -845,11 +764,23 @@ void run_tetris(TetrisGame *game) {
                     case 'd': /* 右移動 */
                         if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, game->minoAngle)) game->minoX++;
                         break;
-                    case ' ':
-                    case 'w': /* 回転 */
+                    case ' ': /* [変更] 回転 (スペースキーのみ) */
                         if (!isHit(game, game->minoX, game->minoY, game->minoType, (game->minoAngle + 1) % MINO_ANGLE_MAX)) {
                             game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
                         }
+                        break;
+                    /* ハードドロップ (w または 上矢印) */
+                    case 'w': 
+                        /* 衝突する直前までループで落とす */
+                        while (!isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
+                            game->minoY++;
+                            game->score += 2; /* ハードドロップボーナス */
+                        }
+                        /* 画面更新 (一瞬で下に落ちた様子を描画) */
+                        display(game);
+                        
+                        /* そのままロック処理へ強制移行 (EVT_TIMERのロックロジックへジャンプ) */
+                        goto LOCK_PROCESS;
                         break;
                 }
                 display(game);
@@ -858,6 +789,9 @@ void run_tetris(TetrisGame *game) {
             case EVT_TIMER:
                 /* 自由落下処理 */
                 if (isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
+                
+                /* ロック処理開始地点 (ハードドロップからも飛んでくる) */
+                LOCK_PROCESS:
                     /* 接地固定 */
                     for (i = 0; i < MINO_HEIGHT; i++) {
                         for (j = 0; j < MINO_WIDTH; j++) {
