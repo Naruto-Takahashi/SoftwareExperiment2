@@ -54,7 +54,7 @@ extern volatile unsigned long tick;
 #define NEXT_OFFSET_Y     4     /* NEXT表示領域のYオフセット */
 
 /* ゲームバランス設定 */
-#define DROP_INTERVAL 600      /* 自然落下の間隔 (tick単位) */
+#define DROP_INTERVAL 100      /* 自然落下の間隔 (tick単位) */
 #define ANIMATION_DURATION 3   /* ライン消去演出の時間 (tick単位) */
 
 /* システム設定 */
@@ -281,26 +281,30 @@ void draw_next_window(TetrisGame *game) {
     int base_x = NEXT_OFFSET_X;
     int base_y = NEXT_OFFSET_Y;
 
-    /* ラベルの描画 (初回または変更時) */
+    /* ラベルの描画 */
     fprintf(game->fp_out, "\x1b[%d;%dH[NEXT]", base_y - 1, base_x);
 
     /* NEXTエリアの描画 (4x4領域) */
     for (i = 0; i < MINO_HEIGHT; i++) {
-        fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, base_x); /* カーソル移動 */
         for (j = 0; j < MINO_WIDTH; j++) {
+            /* ★修正点: jループの中で毎回カーソル位置を指定する */
+            /* 横方向(j)に対して x2 をして幅を確保 */
+            fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, base_x + (j * 2));
+
             /* NEXTは回転角0で固定表示 */
             if (minoShapes[next_type][MINO_ANGLE_0][i][j]) {
                 /* 色付きブロック */
                 fprintf(game->fp_out, "%s%s■%s", BG_BLACK, minoColors[next_type], ESC_RESET);
             } else {
                 /* 背景 (空白) */
-                fprintf(game->fp_out, "%s  %s", BG_BLACK, ESC_RESET);
+                /* メインフィールドに合わせて間隔が広がるため、見た目も揃います */
+                fprintf(game->fp_out, "%s・%s", BG_BLACK, ESC_RESET);
             }
         }
     }
     
-    /* 状態更新 */
-    game->prevNextMinoType = next_type;
+    /* 描画後にバッファをフラッシュしておくと反映が確実です（必要に応じて） */
+    fflush(game->fp_out);
 }
 
 /* -------------------------------------------------------------------
