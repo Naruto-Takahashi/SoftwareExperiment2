@@ -1,13 +1,18 @@
 /* ===================================================================
  * tetris_main.c
- 
- * 追加機能:
+ * テーマ3対応: イベント駆動型マルチタスク・テトリス
+ * * 概要:
+ * MC68VZ328用マルチタスクカーネル上で動作する2人対戦テトリス．
+ * シリアルポート(UART)経由でVT100互換ターミナルに画面を描画する．
+ * * 主な機能:
  * - 7-Bagシステムによるミノ生成
  * - 差分更新による描画最適化 (通信量削減)
+ * - ノンブロッキング入力と skipmt() による協調的マルチタスク
  * - 起動時・リトライ時の同期処理
  * - NEXT表示機能
  * - ハードドロップ実装
- * - ゴースト(落下予測)表示機能
+ * - [追加] ゴースト(落下予測)表示機能
+ * - [修正] TrueColor黒背景による透過防止対策
  * =================================================================== */
 
 #include <stdio.h>
@@ -53,6 +58,7 @@ extern volatile unsigned long tick;
 /* ゲームバランス設定 */
 #define DROP_INTERVAL 100      /* 自然落下の間隔 (tick単位) */
 #define ANIMATION_DURATION 3   /* ライン消去演出の時間 (tick単位) */
+#define COUNTDOWN_DELAY 10000
 
 /* システム設定 */
 #define DISPLAY_POLL_INTERVAL 50 /* 描画更新の間引き (CPU負荷軽減用) */
@@ -60,7 +66,7 @@ extern volatile unsigned long tick;
 /* バッファ内の特殊値定義 */
 #define CELL_EMPTY  0
 #define CELL_WALL   1
-#define CELL_GHOST  10 /* ゴースト表示用の値 (既存の色IDと被らない値) */
+#define CELL_GHOST  10 /* [追加] ゴースト表示用の値 (既存の色IDと被らない値) */
 
 /* VT100 エスケープシーケンス (画面制御) */
 #define ESC_CLS      "\x1b[2J"      /* 画面クリア */
@@ -75,6 +81,8 @@ extern volatile unsigned long tick;
 #define ESC_INVERT_OFF "\x1b[?5l"   /* 画面反転解除 */
 
 /* TrueColor エスケープシーケンス定義 */
+/* 注意: "\x1b[40m" は「標準の黒」のため，ターミナル設定によっては透過や紫色になる．
+ * そのため，背景を確実に塗りつぶすために TrueColor の黒 (48;2;0;0;0) を使用する． */
 #define COL_CYAN     "\x1b[38;2;0;255;255m"
 #define COL_YELLOW   "\x1b[38;2;255;255;0m"
 #define COL_PURPLE   "\x1b[38;2;160;32;240m"
@@ -85,7 +93,7 @@ extern volatile unsigned long tick;
 #define COL_WHITE    "\x1b[38;2;255;255;255m"
 #define COL_GRAY     "\x1b[38;2;128;128;128m"
 
-/* ターミナルの背景色透過を防ぐため，RGB指定で完全な黒を出力する */
+/* ★修正: ターミナルの背景色透過を防ぐため，RGB指定で完全な黒を出力する */
 #define BG_BLACK     "\x1b[48;2;0;0;0m" 
 #define COL_WALL     COL_WHITE
 
@@ -268,7 +276,7 @@ void print_cell_content(FILE *fp, char cellVal) {
         /* 壁: 白色ブロック */
         fprintf(fp, "%s%s■%s", BG_BLACK, COL_WALL, ESC_RESET);
     } else if (cellVal == CELL_GHOST) {
-        /* ゴースト: 中抜きの四角 + グレー */
+        /* [追加] ゴースト: 中抜きの四角 + グレー */
         fprintf(fp, "%s%s□%s", BG_BLACK, COL_GRAY, ESC_RESET);
     } else if (cellVal >= 2 && cellVal <= 9) {
         /* ミノ: 各色ブロック */
@@ -346,7 +354,7 @@ void display(TetrisGame *game) {
     /* 1-1. フィールドのコピー */
     memcpy(game->displayBuffer, game->field, sizeof(game->field));
 
-    /* 1-2. ゴーストの計算と描画 */
+    /* 1-2. [追加] ゴーストの計算と描画 */
     if (game->minoType != MINO_TYPE_GARBAGE) {
         int ghostY = game->minoY;
         /* 衝突する直前まで座標を下げる */
@@ -444,6 +452,37 @@ void display(TetrisGame *game) {
 
     /* 変更があった場合のみバッファフラッシュ */
     if (changes > 0) fflush(game->fp_out);
+}
+
+/* -------------------------------------------------------------------
+ * [追加] カウントダウン表示関数
+ * 概要:
+ * ゲーム開始直前に 3, 2, 1, GO! を表示する．
+ * 表示後は prevBuffer をリセットし，次回の display() で
+ * フィールド全体が強制再描画されるようにする（文字を消すため）．
+ * ------------------------------------------------------------------- */
+void perform_countdown(TetrisGame *game) {
+    const char *messages[] = {" 3 ", " 2 ", " 1 ", "GO!"};
+    int i;
+    int base_y = 3 + (FIELD_HEIGHT / 2) - 1;
+    int base_x = 10; /* 常に左側(YOU)に表示 */
+
+    for (i = 0; i < 4; i++) {
+        fprintf(game->fp_out, "\x1b[%d;%dH%s%s   %s   %s", 
+                base_y, base_x - 1, BG_BLACK, COL_YELLOW, messages[i], ESC_RESET);
+        fflush(game->fp_out);
+
+        /* ★修正: 最後の "GO!" (i==3) だけ待ち時間を短くする */
+        unsigned long delay = (i == 3) ? (COUNTDOWN_DELAY / 10) : COUNTDOWN_DELAY;
+        
+        unsigned long target_tick = tick + delay;
+        while (tick < target_tick) {
+            skipmt();
+        }
+    }
+
+    /* バッファをリセット（次のdisplayで確実に消すため） */
+    memset(game->prevBuffer, -1, sizeof(game->prevBuffer));
 }
 
 /* -------------------------------------------------------------------
@@ -737,6 +776,12 @@ void run_tetris(TetrisGame *game) {
     resetMino(game); /* NEXTをCurrentに昇格させ，さらに次のNEXTを準備 */
 
     display(game);
+
+    /* カウントダウン開始 (ここで 3,2,1... と進む) */
+    perform_countdown(game);
+
+    display(game);
+
     game->next_drop_time = tick + DROP_INTERVAL;
 
     /* --- メインループ --- */
