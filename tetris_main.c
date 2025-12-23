@@ -1,16 +1,13 @@
 /* ===================================================================
  * tetris_main.c
- * テーマ3対応: イベント駆動型マルチタスク・テトリス
- * * 概要:
- * MC68VZ328用マルチタスクカーネル上で動作する2人対戦テトリス．
- * シリアルポート(UART)経由でVT100互換ターミナルに画面を描画する．
- * * 主な機能:
+ 
+ * 追加機能:
  * - 7-Bagシステムによるミノ生成
  * - 差分更新による描画最適化 (通信量削減)
- * - ノンブロッキング入力と skipmt() による協調的マルチタスク
  * - 起動時・リトライ時の同期処理
- * - [追加] NEXT表示機能
- * - [追加] ハードドロップ実装
+ * - NEXT表示機能
+ * - ハードドロップ実装
+ * - ゴースト(落下予測)表示機能
  * =================================================================== */
 
 #include <stdio.h>
@@ -60,6 +57,11 @@ extern volatile unsigned long tick;
 /* システム設定 */
 #define DISPLAY_POLL_INTERVAL 50 /* 描画更新の間引き (CPU負荷軽減用) */
 
+/* バッファ内の特殊値定義 */
+#define CELL_EMPTY  0
+#define CELL_WALL   1
+#define CELL_GHOST  10 /* ゴースト表示用の値 (既存の色IDと被らない値) */
+
 /* VT100 エスケープシーケンス (画面制御) */
 #define ESC_CLS      "\x1b[2J"      /* 画面クリア */
 #define ESC_HOME     "\x1b[H"       /* カーソルをホームへ */
@@ -82,7 +84,9 @@ extern volatile unsigned long tick;
 #define COL_RED      "\x1b[38;2;255;0;0m"
 #define COL_WHITE    "\x1b[38;2;255;255;255m"
 #define COL_GRAY     "\x1b[38;2;128;128;128m"
-#define BG_BLACK     "\x1b[40m"
+
+/* ターミナルの背景色透過を防ぐため，RGB指定で完全な黒を出力する */
+#define BG_BLACK     "\x1b[48;2;0;0;0m" 
 #define COL_WALL     COL_WHITE
 
 /* -------------------------------------------------------------------
@@ -243,20 +247,29 @@ char minoShapes[MINO_TYPE_MAX][MINO_ANGLE_MAX][MINO_HEIGHT][MINO_WIDTH] = {
 };
 
 /* -------------------------------------------------------------------
+ * プロトタイプ宣言 (前方参照が必要なもの)
+ * ------------------------------------------------------------------- */
+int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngle);
+
+/* -------------------------------------------------------------------
  * 描画ヘルパー関数
  * ------------------------------------------------------------------- */
 
 /*
  * print_cell_content
- * 1セル分の内容をエスケープシーケンス付きで出力する
+ * 1セル分の内容をエスケープシーケンス付きで出力する．
+ * BG_BLACK (RGB:0,0,0) を明示的に指定することで，背景の透けを防ぐ．
  */
 void print_cell_content(FILE *fp, char cellVal) {
-    if (cellVal == 0) {
+    if (cellVal == CELL_EMPTY) {
         /* 空白: ドット表示 */
         fprintf(fp, "%s・%s", BG_BLACK, ESC_RESET);
-    } else if (cellVal == 1) {
+    } else if (cellVal == CELL_WALL) {
         /* 壁: 白色ブロック */
         fprintf(fp, "%s%s■%s", BG_BLACK, COL_WALL, ESC_RESET);
+    } else if (cellVal == CELL_GHOST) {
+        /* ゴースト: 中抜きの四角 + グレー */
+        fprintf(fp, "%s%s□%s", BG_BLACK, COL_GRAY, ESC_RESET);
     } else if (cellVal >= 2 && cellVal <= 9) {
         /* ミノ: 各色ブロック */
         fprintf(fp, "%s%s■%s", BG_BLACK, minoColors[cellVal - 2], ESC_RESET);
@@ -287,30 +300,26 @@ void draw_next_window(TetrisGame *game) {
     /* NEXTエリアの描画 (4x4領域) */
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
-            /* ★修正点: jループの中で毎回カーソル位置を指定する */
-            /* 横方向(j)に対して x2 をして幅を確保 */
+            /* NEXT表示領域のカーソル位置設定 (横幅x2) */
             fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, base_x + (j * 2));
 
             /* NEXTは回転角0で固定表示 */
             if (minoShapes[next_type][MINO_ANGLE_0][i][j]) {
-                /* 色付きブロック */
+                /* ここでも BG_BLACK を使用して背景を塗りつぶす */
                 fprintf(game->fp_out, "%s%s■%s", BG_BLACK, minoColors[next_type], ESC_RESET);
             } else {
-                /* 背景 (空白) */
-                /* メインフィールドに合わせて間隔が広がるため、見た目も揃います */
                 fprintf(game->fp_out, "%s・%s", BG_BLACK, ESC_RESET);
             }
         }
     }
     
-    /* 描画後にバッファをフラッシュしておくと反映が確実です（必要に応じて） */
     fflush(game->fp_out);
 }
 
 /* -------------------------------------------------------------------
  * display: 画面描画関数 (最適化版)
  * 概要:
- * 現在のフィールドと落下中のミノを合成し，
+ * 現在のフィールド，ゴースト，落下中のミノを合成し，
  * 前回描画内容と異なる部分のみを出力する(差分更新)．
  * これによりシリアル通信(38400bps)の帯域を節約する．
  * ------------------------------------------------------------------- */
@@ -329,8 +338,40 @@ void display(TetrisGame *game) {
     }
     game->opponent_was_connected = opponent_connected;
 
-    /* 1. 描画バッファの作成 (フィールド + 現在のミノ) */
+    /* * --- 1. 描画バッファの作成 ---
+     * 優先順位: 既存フィールド < ゴースト < 現在のミノ
+     * 後から描画したものが上書きされる仕組みで合成する
+     */
+    
+    /* 1-1. フィールドのコピー */
     memcpy(game->displayBuffer, game->field, sizeof(game->field));
+
+    /* 1-2. ゴーストの計算と描画 */
+    if (game->minoType != MINO_TYPE_GARBAGE) {
+        int ghostY = game->minoY;
+        /* 衝突する直前まで座標を下げる */
+        while (!isHit(game, game->minoX, ghostY + 1, game->minoType, game->minoAngle)) {
+            ghostY++;
+        }
+        
+        /* ゴーストをバッファに書き込み */
+        for (i = 0; i < MINO_HEIGHT; i++) {
+            for (j = 0; j < MINO_WIDTH; j++) {
+                if (minoShapes[game->minoType][game->minoAngle][i][j]) {
+                    if (ghostY + i >= 0 && ghostY + i < FIELD_HEIGHT &&
+                        game->minoX + j >= 0 && game->minoX + j < FIELD_WIDTH) {
+                        /* 既存ブロックを上書きしないよう，空の場合のみ書き込む */
+                        /* (isHitでチェック済みなので本来重ならないが念のため) */
+                        if (game->displayBuffer[ghostY + i][game->minoX + j] == CELL_EMPTY) {
+                            game->displayBuffer[ghostY + i][game->minoX + j] = CELL_GHOST;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* 1-3. 現在のミノの描画 (ゴーストを上書きする) */
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
             if (game->minoType != MINO_TYPE_GARBAGE && 
@@ -344,7 +385,7 @@ void display(TetrisGame *game) {
         }
     }
 
-    /* 2. ヘッダ情報(スコア等)の描画 */
+    /* --- 2. ヘッダ情報(スコア等)の描画 --- */
     fprintf(game->fp_out, "\x1b[1;1H"); /* カーソルを(1，1)へ */
     fprintf(game->fp_out, "[YOU] SC:%-5d LN:%-3d ATK:%d", 
             game->score, game->lines_cleared, game->pending_garbage);
@@ -366,7 +407,7 @@ void display(TetrisGame *game) {
     }
     fprintf(game->fp_out, "%s", ESC_CLR_LINE);
 
-    /* 3. フィールド描画 (差分更新) */
+    /* --- 3. フィールド描画 (差分更新) --- */
     int base_y = 3;
 
     for (i = 0; i < FIELD_HEIGHT; i++) {
@@ -376,6 +417,7 @@ void display(TetrisGame *game) {
             /* 前回と値が違う場合のみ描画 */
             if (myVal != game->prevBuffer[i][j]) {
                 fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, j * 2 + 1);
+                /* ここで print_cell_content を呼び出し，黒背景で描画 */
                 print_cell_content(game->fp_out, myVal);
                 game->prevBuffer[i][j] = myVal;
                 changes++;
@@ -443,7 +485,7 @@ Event wait_event(TetrisGame *game) {
                 /* コマンド受信 */
                 game->seq_state = 0;
                 switch (c) {
-                    case 'A': e.param = 'w'; break; /* Up -> 'w' (HardDropに割り当て予定) */
+                    case 'A': e.param = 'w'; break; /* Up -> 'w' (HardDrop) */
                     case 'B': e.param = 's'; break; /* Down */
                     case 'C': e.param = 'd'; break; /* Right */
                     case 'D': e.param = 'a'; break; /* Left */
@@ -589,7 +631,6 @@ void wait_start(TetrisGame *game) {
     }
 
     /* 2. 乱数初期化: 押された瞬間の tick をシードにする */
-    /* これにより，起動直後でも毎回異なるミノ順序になる */
     srand((unsigned int)tick);
 
     /* 3. 開始同期 (相手が準備完了するのを待つ) */
@@ -768,7 +809,7 @@ void run_tetris(TetrisGame *game) {
                     case 'd': /* 右移動 */
                         if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, game->minoAngle)) game->minoX++;
                         break;
-                    case ' ': /* [変更] 回転 (スペースキーのみ) */
+                    case ' ': /* 回転 */
                         if (!isHit(game, game->minoX, game->minoY, game->minoType, (game->minoAngle + 1) % MINO_ANGLE_MAX)) {
                             game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
                         }
