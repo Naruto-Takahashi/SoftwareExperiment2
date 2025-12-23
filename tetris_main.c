@@ -50,7 +50,7 @@ extern volatile unsigned long tick;
 #define OPPONENT_OFFSET_X 40    /* 相手画面の表示Xオフセット */
 
 /* ゲームバランス設定 */
-#define DROP_INTERVAL 300      /* 自然落下の間隔 (tick単位) */
+#define DROP_INTERVAL 600     /* 自然落下の間隔 (tick単位) */
 #define ANIMATION_DURATION 3   /* ライン消去演出の時間 (tick単位) */
 
 /* システム設定 */
