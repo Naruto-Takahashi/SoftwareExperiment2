@@ -1,88 +1,84 @@
-/* ===================================================================
+/* ===========================================================================
  * tetris_main.c
  * テーマ3対応: イベント駆動型マルチタスク・テトリス
- * * 概要:
+ *
+ * [概要]
  * MC68VZ328用マルチタスクカーネル上で動作する2人対戦テトリス．
  * シリアルポート(UART)経由でVT100互換ターミナルに画面を描画する．
- * * 主な機能:
- * - 7-Bagシステムによるミノ生成
+ *
+ * [主な機能]
+ * - 7-Bagシステムによる公平なミノ生成
  * - 差分更新による描画最適化 (通信量削減)
  * - ノンブロッキング入力と skipmt() による協調的マルチタスク
- * - 起動時・リトライ時の同期処理
- * - NEXT表示機能
- * - ハードドロップ実装
- * - [追加] ゴースト(落下予測)表示機能
- * - [修正] TrueColor黒背景による透過防止対策
- * =================================================================== */
+ * - 対戦相手との同期処理 (開始時・リトライ時)
+ * - ゴースト(落下予測)表示機能
+ * - お邪魔ラインの送り合い機能
+ *
+ * [更新履歴]
+ * - 修正: 背景色指定を標準ANSIカラー(\x1b[40m)に戻し，初期描画の不具合を修正
+ * - 修正: カウントダウン後の操作ラグを完全排除
+ * - 修正: 動作軽量化のためNEXT表示機能を削除
+ * - 整理: コードフォーマットとコメントの拡充 (Refactoring)
+ * =========================================================================== */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "mtk_c.h"
 
-/* -------------------------------------------------------------------
- * 外部変数・関数の宣言
- * ------------------------------------------------------------------- */
-/* ファイルポインタ (csys68k.c 等で定義) */
+/* ===========================================================================
+ * 外部関数・変数の宣言 (Kernel / Hardware Dependent)
+ * =========================================================================== */
 extern FILE *com0in;
 extern FILE *com0out;
 extern FILE *com1in;
 extern FILE *com1out;
 
-/* カーネル関数・システムコール (mtk_c.c / inchrw.s 等) */
 extern void init_kernel(void);
 extern void set_task(void (*func)());
 extern void begin_sch(void);
-extern int inbyte(int ch);
-extern void skipmt(void);
+extern int inbyte(int ch);      /* ノンブロッキング入力 (戻り値 -1 で入力なし) */
+extern void skipmt(void);       /* タスク切り替え要求 (協調的マルチタスク) */
 
-/* タイマーティックカウンタ (mtk_c.c) */
 extern volatile unsigned long tick; 
 
-/* -------------------------------------------------------------------
+/* ===========================================================================
  * 定数・マクロ定義
- * ------------------------------------------------------------------- */
-/* フィールドサイズ */
+ * =========================================================================== */
+
+/* --- フィールド設定 --- */
 #define FIELD_WIDTH  12
 #define FIELD_HEIGHT 22
-
-/* ミノの最大サイズ (4x4) */
 #define MINO_WIDTH   4
 #define MINO_HEIGHT  4
 
-/* 画面レイアウト */
+/* --- 画面レイアウト設定 --- */
 #define OPPONENT_OFFSET_X 40    /* 相手画面の表示Xオフセット */
-#define NEXT_OFFSET_X     27    /* NEXT表示領域のXオフセット */
-#define NEXT_OFFSET_Y     4     /* NEXT表示領域のYオフセット */
 
-/* ゲームバランス設定 */
-#define DROP_INTERVAL 100      /* 自然落下の間隔 (tick単位) */
-#define ANIMATION_DURATION 3   /* ライン消去演出の時間 (tick単位) */
-#define COUNTDOWN_DELAY 10000
+/* --- ゲームバランス設定 --- */
+#define DROP_INTERVAL 100       /* 自然落下の間隔 (tick単位) */
+#define ANIMATION_DURATION 3    /* ライン消去演出の時間 (tick単位) */
+#define COUNTDOWN_DELAY 100     /* カウントダウンの待ち時間 (tick単位) */
 
-/* システム設定 */
+/* --- システム設定 --- */
 #define DISPLAY_POLL_INTERVAL 50 /* 描画更新の間引き (CPU負荷軽減用) */
 
-/* バッファ内の特殊値定義 */
+/* --- バッファ内の特殊値定義 --- */
 #define CELL_EMPTY  0
 #define CELL_WALL   1
-#define CELL_GHOST  10 /* [追加] ゴースト表示用の値 (既存の色IDと被らない値) */
+#define CELL_GHOST  10          /* ゴースト表示用の内部値 */
 
-/* VT100 エスケープシーケンス (画面制御) */
+/* --- VT100 エスケープシーケンス (制御コード) --- */
 #define ESC_CLS      "\x1b[2J"      /* 画面クリア */
 #define ESC_HOME     "\x1b[H"       /* カーソルをホームへ */
 #define ESC_RESET    "\x1b[0m"      /* 属性リセット */
 #define ESC_HIDE_CUR "\x1b[?25l"    /* カーソル非表示 */
 #define ESC_SHOW_CUR "\x1b[?25h"    /* カーソル表示 */
 #define ESC_CLR_LINE "\x1b[K"       /* 行末まで消去 */
-
-/* 演出用エスケープシーケンス */
 #define ESC_INVERT_ON  "\x1b[?5h"   /* 画面反転 (フラッシュ) */
 #define ESC_INVERT_OFF "\x1b[?5l"   /* 画面反転解除 */
 
-/* TrueColor エスケープシーケンス定義 */
-/* 注意: "\x1b[40m" は「標準の黒」のため，ターミナル設定によっては透過や紫色になる．
- * そのため，背景を確実に塗りつぶすために TrueColor の黒 (48;2;0;0;0) を使用する． */
+/* --- TrueColor 定義 (24bitカラー) --- */
 #define COL_CYAN     "\x1b[38;2;0;255;255m"
 #define COL_YELLOW   "\x1b[38;2;255;255;0m"
 #define COL_PURPLE   "\x1b[38;2;160;32;240m"
@@ -93,13 +89,12 @@ extern volatile unsigned long tick;
 #define COL_WHITE    "\x1b[38;2;255;255;255m"
 #define COL_GRAY     "\x1b[38;2;128;128;128m"
 
-/* ★修正: ターミナルの背景色透過を防ぐため，RGB指定で完全な黒を出力する */
-#define BG_BLACK     "\x1b[48;2;0;0;0m" 
 #define COL_WALL     COL_WHITE
+#define BG_BLACK     "\x1b[40m" 
 
-/* -------------------------------------------------------------------
+/* ===========================================================================
  * 型定義
- * ------------------------------------------------------------------- */
+ * =========================================================================== */
 
 /* ゲームの進行状態 */
 typedef enum {
@@ -115,7 +110,7 @@ typedef enum {
     EVT_TIMER,      /* 落下タイマー発火 */
     EVT_WIN,        /* 勝利 (相手がゲームオーバー) */
     EVT_QUIT,       /* 中断要求 */
-    EVT_REFRESH     /* 画面更新 (必要に応じて) */
+    EVT_REFRESH     /* 画面更新 (予約) */
 } EventType;
 
 /* イベント構造体 */
@@ -124,18 +119,16 @@ typedef struct {
     int param;      /* キーコードなどの付加情報 */
 } Event;
 
-/* * テトリスのゲームコンテキスト構造体
- * 1人のプレイヤーに必要な全ての情報を保持する
- */
+/* テトリスのゲームコンテキスト構造体 */
 typedef struct {
     /* 入出力設定 */
     int port_id;        /* ポート番号 (0 or 1) */
     FILE *fp_out;       /* 出力用ファイルポインタ */
     
     /* フィールドバッファ */
-    char field[FIELD_HEIGHT][FIELD_WIDTH];          /* 論理フィールド (固定されたブロック) */
-    char displayBuffer[FIELD_HEIGHT][FIELD_WIDTH];  /* 描画用バッファ (現在フレーム) */
-    char prevBuffer[FIELD_HEIGHT][FIELD_WIDTH];     /* 前回描画したバッファ (差分検出用) */
+    char field[FIELD_HEIGHT][FIELD_WIDTH];          /* 論理フィールド (ロジック用) */
+    char displayBuffer[FIELD_HEIGHT][FIELD_WIDTH];  /* 描画合成用バッファ */
+    char prevBuffer[FIELD_HEIGHT][FIELD_WIDTH];     /* 前回描画時の状態 (差分検出用) */
     
     /* 対戦相手の画面同期用 */
     char prevOpponentBuffer[FIELD_HEIGHT][FIELD_WIDTH]; 
@@ -152,11 +145,11 @@ typedef struct {
     int minoX;      /* X座標 */
     int minoY;      /* Y座標 */
     
-    /* NEXTミノ情報 */
-    int nextMinoType;       /* 次に出現するミノの種類 */
-    int prevNextMinoType;   /* 前回描画したNEXTミノ (差分更新用) */
+    /* NEXTミノ情報 (描画機能は削除済みだがデータは保持) */
+    int nextMinoType;       
+    int prevNextMinoType;   
 
-    /* ミノ生成 (7-Bag システム) */
+    /* ミノ生成 (7-Bag システム用) */
     int bag[7];
     int bag_index;
 
@@ -170,7 +163,7 @@ typedef struct {
     int score;
     int lines_cleared;
     
-    /* 対戦・同期フラグ (volatile必須) */
+    /* 対戦・同期フラグ (volatile必須: 他タスクから書き換えられるため) */
     volatile int pending_garbage;   /* 相手から送られた未処理のお邪魔ライン */
     volatile int is_gameover;       /* 自身がゲームオーバーになったか */
     volatile int sync_generation;   /* ゲーム開始/リトライの同期用カウンタ */
@@ -180,26 +173,31 @@ typedef struct {
 /* 全ゲームインスタンスへのポインタ (対戦相手参照用) */
 TetrisGame *all_games[2] = {NULL, NULL};
 
-/* -------------------------------------------------------------------
+/* ===========================================================================
  * グローバルデータ (ミノ形状・色定義)
- * ------------------------------------------------------------------- */
+ * =========================================================================== */
+
+/* ミノの種類のID定義 */
 enum { 
     MINO_TYPE_I, MINO_TYPE_O, MINO_TYPE_S, MINO_TYPE_Z, 
     MINO_TYPE_J, MINO_TYPE_L, MINO_TYPE_T, 
-    MINO_TYPE_GARBAGE, /* お邪魔ブロック用 */
+    MINO_TYPE_GARBAGE, 
     MINO_TYPE_MAX 
 };
 
+/* ミノの色定義 */
 const char* minoColors[MINO_TYPE_MAX] = { 
     COL_CYAN, COL_YELLOW, COL_GREEN, COL_RED, 
     COL_BLUE, COL_ORANGE, COL_PURPLE, COL_GRAY 
 };
 
-enum { MINO_ANGLE_0, MINO_ANGLE_90, MINO_ANGLE_180, MINO_ANGLE_270, MINO_ANGLE_MAX };
+/* 回転角度のID定義 */
+enum { 
+    MINO_ANGLE_0, MINO_ANGLE_90, MINO_ANGLE_180, MINO_ANGLE_270, 
+    MINO_ANGLE_MAX 
+};
 
-/* * ミノ形状データ (4x4x4方向)
- * 1: ブロックあり， 0: 空白
- */
+/* ミノ形状データ (種類 x 角度 x 高さ x 幅) */
 char minoShapes[MINO_TYPE_MAX][MINO_ANGLE_MAX][MINO_HEIGHT][MINO_WIDTH] = {
     /* MINO_TYPE_I */
     {
@@ -227,7 +225,7 @@ char minoShapes[MINO_TYPE_MAX][MINO_ANGLE_MAX][MINO_HEIGHT][MINO_WIDTH] = {
         { {0, 0, 0, 0}, {1, 1, 0, 0}, {0, 1, 1, 0}, {0, 0, 0, 0} },
         { {0, 0, 1, 0}, {0, 1, 1, 0}, {0, 1, 0, 0}, {0, 0, 0, 0} },
         { {0, 0, 0, 0}, {0, 1, 1, 0}, {0, 0, 1, 1}, {0, 0, 0, 0} },
-        { {0, 0, 0, 0}, {0, 0, 1, 0}, {0, 1, 1, 0}, {0, 1, 0, 0} }
+        { {0, 0, 0, 0}, {0, 0, 1, 0}, {0, 1, 1, 0}, {1, 1, 0, 0} }
     },
     /* MINO_TYPE_J */
     {
@@ -250,23 +248,25 @@ char minoShapes[MINO_TYPE_MAX][MINO_ANGLE_MAX][MINO_HEIGHT][MINO_WIDTH] = {
         { {0, 0, 0, 0}, {0, 0, 1, 0}, {0, 1, 1, 1}, {0, 0, 0, 0} },
         { {0, 0, 0, 0}, {0, 1, 0, 0}, {0, 1, 1, 0}, {0, 1, 0, 0} }
     },
-    /* MINO_TYPE_GARBAGE (形状定義なし) */
+    /* MINO_TYPE_GARBAGE */
     { {{0}},{{0}},{{0}},{{0}} }
 };
 
-/* -------------------------------------------------------------------
- * プロトタイプ宣言 (前方参照が必要なもの)
- * ------------------------------------------------------------------- */
+/* ===========================================================================
+ * プロトタイプ宣言
+ * =========================================================================== */
 int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngle);
+void print_cell_content(FILE *fp, char cellVal);
+void display(TetrisGame *game);
 
-/* -------------------------------------------------------------------
- * 描画ヘルパー関数
- * ------------------------------------------------------------------- */
+/* ===========================================================================
+ * 描画関連 関数群
+ * =========================================================================== */
 
 /*
- * print_cell_content
- * 1セル分の内容をエスケープシーケンス付きで出力する．
- * BG_BLACK (RGB:0,0,0) を明示的に指定することで，背景の透けを防ぐ．
+ * [print_cell_content]
+ * 1セル分の内容を出力する．
+ * note: BG_BLACK (\x1b[40m) を毎回指定し，背景描画の整合性を保つ．
  */
 void print_cell_content(FILE *fp, char cellVal) {
     if (cellVal == CELL_EMPTY) {
@@ -276,61 +276,23 @@ void print_cell_content(FILE *fp, char cellVal) {
         /* 壁: 白色ブロック */
         fprintf(fp, "%s%s■%s", BG_BLACK, COL_WALL, ESC_RESET);
     } else if (cellVal == CELL_GHOST) {
-        /* [追加] ゴースト: 中抜きの四角 + グレー */
+        /* ゴースト: 中抜きの四角 */
         fprintf(fp, "%s%s□%s", BG_BLACK, COL_GRAY, ESC_RESET);
     } else if (cellVal >= 2 && cellVal <= 9) {
-        /* ミノ: 各色ブロック */
+        /* ミノ: 各色ブロック (背景は黒) */
         fprintf(fp, "%s%s■%s", BG_BLACK, minoColors[cellVal - 2], ESC_RESET);
     } else {
-        /* エラー表示 */
+        /* 未定義値のエラー表示 */
         fprintf(fp, "??");
     }
 }
 
-/* -------------------------------------------------------------------
- * NEXTミノ描画関数
- * 概要:
- * フィールド右側に次のミノを表示する．
- * prevNextMinoType を使用して，変化があったときのみ再描画する．
- * ------------------------------------------------------------------- */
-void draw_next_window(TetrisGame *game) {
-    /* 変化がなければ描画しない */
-    if (game->nextMinoType == game->prevNextMinoType) return;
-
-    int i, j;
-    int next_type = game->nextMinoType;
-    int base_x = NEXT_OFFSET_X;
-    int base_y = NEXT_OFFSET_Y;
-
-    /* ラベルの描画 */
-    fprintf(game->fp_out, "\x1b[%d;%dH[NEXT]", base_y - 1, base_x);
-
-    /* NEXTエリアの描画 (4x4領域) */
-    for (i = 0; i < MINO_HEIGHT; i++) {
-        for (j = 0; j < MINO_WIDTH; j++) {
-            /* NEXT表示領域のカーソル位置設定 (横幅x2) */
-            fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, base_x + (j * 2));
-
-            /* NEXTは回転角0で固定表示 */
-            if (minoShapes[next_type][MINO_ANGLE_0][i][j]) {
-                /* ここでも BG_BLACK を使用して背景を塗りつぶす */
-                fprintf(game->fp_out, "%s%s■%s", BG_BLACK, minoColors[next_type], ESC_RESET);
-            } else {
-                fprintf(game->fp_out, "%s・%s", BG_BLACK, ESC_RESET);
-            }
-        }
-    }
-    
-    fflush(game->fp_out);
-}
-
-/* -------------------------------------------------------------------
- * display: 画面描画関数 (最適化版)
- * 概要:
- * 現在のフィールド，ゴースト，落下中のミノを合成し，
- * 前回描画内容と異なる部分のみを出力する(差分更新)．
- * これによりシリアル通信(38400bps)の帯域を節約する．
- * ------------------------------------------------------------------- */
+/*
+ * [display]
+ * メインの画面描画関数．
+ * 概要: 現在のフィールド，ゴースト，落下中のミノを合成し，
+ * 前回のフレームとの差分のみを出力することで通信量を削減する．
+ */
 void display(TetrisGame *game) {
     int i, j;
     int changes = 0;
@@ -346,30 +308,26 @@ void display(TetrisGame *game) {
     }
     game->opponent_was_connected = opponent_connected;
 
-    /* * --- 1. 描画バッファの作成 ---
-     * 優先順位: 既存フィールド < ゴースト < 現在のミノ
-     * 後から描画したものが上書きされる仕組みで合成する
-     */
+    /* -----------------------------------------------
+     * 1. 描画用バッファの作成
+     * ----------------------------------------------- */
     
-    /* 1-1. フィールドのコピー */
+    /* 1-1. 現在のフィールド状態をコピー */
     memcpy(game->displayBuffer, game->field, sizeof(game->field));
 
-    /* 1-2. [追加] ゴーストの計算と描画 */
+    /* 1-2. ゴースト(落下予測位置)の計算と描画 */
     if (game->minoType != MINO_TYPE_GARBAGE) {
         int ghostY = game->minoY;
-        /* 衝突する直前まで座標を下げる */
         while (!isHit(game, game->minoX, ghostY + 1, game->minoType, game->minoAngle)) {
             ghostY++;
         }
         
-        /* ゴーストをバッファに書き込み */
         for (i = 0; i < MINO_HEIGHT; i++) {
             for (j = 0; j < MINO_WIDTH; j++) {
                 if (minoShapes[game->minoType][game->minoAngle][i][j]) {
                     if (ghostY + i >= 0 && ghostY + i < FIELD_HEIGHT &&
                         game->minoX + j >= 0 && game->minoX + j < FIELD_WIDTH) {
-                        /* 既存ブロックを上書きしないよう，空の場合のみ書き込む */
-                        /* (isHitでチェック済みなので本来重ならないが念のため) */
+                        /* 空の場合のみ書き込む(ミノ本体の上書き防止) */
                         if (game->displayBuffer[ghostY + i][game->minoX + j] == CELL_EMPTY) {
                             game->displayBuffer[ghostY + i][game->minoX + j] = CELL_GHOST;
                         }
@@ -379,12 +337,11 @@ void display(TetrisGame *game) {
         }
     }
 
-    /* 1-3. 現在のミノの描画 (ゴーストを上書きする) */
+    /* 1-3. 現在落下中のミノを描画 */
     for (i = 0; i < MINO_HEIGHT; i++) {
         for (j = 0; j < MINO_WIDTH; j++) {
             if (game->minoType != MINO_TYPE_GARBAGE && 
                 minoShapes[game->minoType][game->minoAngle][i][j]) {
-                /* フィールド範囲内ならバッファに書き込む */
                 if (game->minoY + i >= 0 && game->minoY + i < FIELD_HEIGHT &&
                     game->minoX + j >= 0 && game->minoX + j < FIELD_WIDTH) {
                     game->displayBuffer[game->minoY + i][game->minoX + j] = 2 + game->minoType;
@@ -393,8 +350,10 @@ void display(TetrisGame *game) {
         }
     }
 
-    /* --- 2. ヘッダ情報(スコア等)の描画 --- */
-    fprintf(game->fp_out, "\x1b[1;1H"); /* カーソルを(1，1)へ */
+    /* -----------------------------------------------
+     * 2. ヘッダ情報(スコア等)の描画
+     * ----------------------------------------------- */
+    fprintf(game->fp_out, "\x1b[1;1H"); 
     fprintf(game->fp_out, "[YOU] SC:%-5d LN:%-3d ATK:%d", 
             game->score, game->lines_cleared, game->pending_garbage);
     
@@ -406,7 +365,7 @@ void display(TetrisGame *game) {
         fprintf(game->fp_out, "\x1b[1;%dH", OPPONENT_OFFSET_X);
         fprintf(game->fp_out, "[RIVAL] (Waiting...)    ");
     }
-    fprintf(game->fp_out, "%s", ESC_CLR_LINE); /* 行末消去 */
+    fprintf(game->fp_out, "%s", ESC_CLR_LINE);
 
     fprintf(game->fp_out, "\n--------------------------");
     if (opponent != NULL) {
@@ -415,28 +374,27 @@ void display(TetrisGame *game) {
     }
     fprintf(game->fp_out, "%s", ESC_CLR_LINE);
 
-    /* --- 3. フィールド描画 (差分更新) --- */
+    /* -----------------------------------------------
+     * 3. フィールド描画 (差分更新アルゴリズム)
+     * ----------------------------------------------- */
     int base_y = 3;
 
     for (i = 0; i < FIELD_HEIGHT; i++) {
-        /* --- 左側: 自分 --- */
+        /* --- 左側: 自分のフィールド --- */
         for (j = 0; j < FIELD_WIDTH; j++) {
             char myVal = game->displayBuffer[i][j];
-            /* 前回と値が違う場合のみ描画 */
             if (myVal != game->prevBuffer[i][j]) {
                 fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, j * 2 + 1);
-                /* ここで print_cell_content を呼び出し，黒背景で描画 */
                 print_cell_content(game->fp_out, myVal);
                 game->prevBuffer[i][j] = myVal;
                 changes++;
             }
         }
 
-        /* --- 右側: 相手 --- */
+        /* --- 右側: 相手のフィールド --- */
         if (opponent != NULL) {
             for (j = 0; j < FIELD_WIDTH; j++) {
                 char oppVal = opponent->displayBuffer[i][j];
-                /* 相手画面も差分のみ更新 */
                 if (oppVal != game->prevOpponentBuffer[i][j]) {
                     fprintf(game->fp_out, "\x1b[%d;%dH", base_y + i, OPPONENT_OFFSET_X + j * 2);
                     print_cell_content(game->fp_out, oppVal);
@@ -447,20 +405,15 @@ void display(TetrisGame *game) {
         }
     }
     
-    /* 4. NEXT表示の更新 */
-    draw_next_window(game);
-
-    /* 変更があった場合のみバッファフラッシュ */
+    /* 描画に変更があった場合のみフラッシュ */
     if (changes > 0) fflush(game->fp_out);
 }
 
-/* -------------------------------------------------------------------
- * [追加] カウントダウン表示関数
- * 概要:
- * ゲーム開始直前に 3, 2, 1, GO! を表示する．
- * 表示後は prevBuffer をリセットし，次回の display() で
- * フィールド全体が強制再描画されるようにする（文字を消すため）．
- * ------------------------------------------------------------------- */
+/*
+ * [perform_countdown]
+ * 開始時のカウントダウン (3 -> 2 -> 1 -> GO!)
+ * note: "GO!" 表示後はウェイトを入れず即座に入力受付を開始する．
+ */
 void perform_countdown(TetrisGame *game) {
     const char *messages[] = {" 3 ", " 2 ", " 1 ", "GO!"};
     int i;
@@ -472,27 +425,34 @@ void perform_countdown(TetrisGame *game) {
                 base_y, base_x - 1, BG_BLACK, COL_YELLOW, messages[i], ESC_RESET);
         fflush(game->fp_out);
 
-        /* ★修正: 最後の "GO!" (i==3) だけ待ち時間を短くする */
-        unsigned long delay = (i == 3) ? (COUNTDOWN_DELAY / 10) : COUNTDOWN_DELAY;
+        /* GO! (i==3) の場合，即座にループを抜ける */
+        if (i == 3) {
+             break;
+        }
         
-        unsigned long target_tick = tick + delay;
+        unsigned long target_tick = tick + COUNTDOWN_DELAY;
         while (tick < target_tick) {
             skipmt();
         }
     }
 
-    /* バッファをリセット（次のdisplayで確実に消すため） */
+    /* バッファをリセット（次のdisplayで文字を消去させるため） */
     memset(game->prevBuffer, -1, sizeof(game->prevBuffer));
 }
 
-/* -------------------------------------------------------------------
- * wait_event: イベント待機・処理関数
- * 概要:
- * - ノンブロッキング入力 (inbyte) を監視する．
- * - 入力がなければ skipmt() を呼び，他タスクにCPU権を譲る．
- * - 矢印キーのエスケープシーケンス(ESC [ A など)を解析する．
- * - 一定時間経過(tick)でタイマーイベントを返す．
- * ------------------------------------------------------------------- */
+/* ===========================================================================
+ * イベント制御・入力処理
+ * =========================================================================== */
+
+/*
+ * [wait_event]
+ * イベント待機・処理ループ．
+ * 機能:
+ * - 相手の勝敗チェック
+ * - シリアル入力のポーリングとエスケープシーケンス解析
+ * - タイマーによる自然落下
+ * - アニメーション中の描画更新
+ */
 Event wait_event(TetrisGame *game) {
     Event e;
     e.type = EVT_NONE;
@@ -510,60 +470,59 @@ Event wait_event(TetrisGame *game) {
         /* ノンブロッキング入力取得 */
         c = inbyte(game->port_id);
         if (c != -1) {
-            /* キー入力あり: エスケープシーケンスのステートマシン処理 */
+            /* VT100 エスケープシーケンス解析ステートマシン */
             if (game->seq_state == 0) {
-                if (c == 0x1b) game->seq_state = 1;     /* ESC受信 */
+                if (c == 0x1b) game->seq_state = 1;
                 else if (c == 'q') { e.type = EVT_QUIT; return e; }
                 else { e.type = EVT_KEY_INPUT; e.param = c; return e; }
             } 
             else if (game->seq_state == 1) {
-                if (c == '[') game->seq_state = 2;      /* [ 受信 */
+                if (c == '[') game->seq_state = 2;
                 else game->seq_state = 0;
             } 
             else if (game->seq_state == 2) {
-                /* コマンド受信 */
                 game->seq_state = 0;
                 switch (c) {
-                    case 'A': e.param = 'w'; break; /* Up -> 'w' (HardDrop) */
-                    case 'B': e.param = 's'; break; /* Down */
-                    case 'C': e.param = 'd'; break; /* Right */
-                    case 'D': e.param = 'a'; break; /* Left */
+                    case 'A': e.param = 'w'; break; /* 上矢印 */
+                    case 'B': e.param = 's'; break; /* 下矢印 */
+                    case 'C': e.param = 'd'; break; /* 右矢印 */
+                    case 'D': e.param = 'a'; break; /* 左矢印 */
                     default:  e.param = 0;   break;
                 }
                 if (e.param != 0) { e.type = EVT_KEY_INPUT; return e; }
             }
         } 
         else {
-            /* 入力なし: タイマー判定 */
+            /* 入力なし: タイマーチェック */
             if (tick >= game->next_drop_time) {
                 e.type = EVT_TIMER;
                 return e;
             }
             
-            /* 画面の定期更新 (ポーリング頻度を落とす) */
+            /* 描画更新 (負荷軽減のため間引き) */
             poll_counter++;
             if (poll_counter >= DISPLAY_POLL_INTERVAL) {
                 display(game); 
                 poll_counter = 0;
-                
-                /* アニメーション中ならイベントなしでリターンして処理を進める */
+                /* アニメーション中は入力を待たずにループを回す */
                 if (game->state == GS_ANIMATING) {
                     e.type = EVT_NONE; 
                     return e; 
                 }
             }
-            
-            /* 処理することがないのでタスク切り替え (CPUを譲る) */
-            skipmt();
+            skipmt(); /* 他タスクへ制御を譲る */
         }
     }
 }
 
-/* -------------------------------------------------------------------
- * ゲームロジック関数群
- * ------------------------------------------------------------------- */
+/* ===========================================================================
+ * ゲームロジック (判定・データ操作)
+ * =========================================================================== */
 
-/* 当たり判定 (1:衝突， 0:なし) */
+/*
+ * [isHit]
+ * 当たり判定を行う．壁，床，既存ブロックとの衝突を検知する．
+ */
 int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngle) {
     int i, j;
     for (i = 0; i < MINO_HEIGHT; i++) {
@@ -571,9 +530,7 @@ int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngl
             if (minoShapes[_minoType][_minoAngle][i][j]) {
                 int fy = _minoY + i;
                 int fx = _minoX + j;
-                /* 壁・床判定 */
                 if (fy < 0 || fy >= FIELD_HEIGHT || fx < 0 || fx >= FIELD_WIDTH) return 1;
-                /* 既存ブロック判定 */
                 if (game->field[fy][fx]) return 1;
             }
         }
@@ -581,12 +538,13 @@ int isHit(TetrisGame *game, int _minoX, int _minoY, int _minoType, int _minoAngl
     return 0;
 }
 
-/* 7-Bagシステムによるミノ順序生成 (ランダムシャッフル) */
+/*
+ * [fillBag]
+ * 7-Bag System: 7種類のミノをランダムに並び替えて袋(bag)に詰める．
+ */
 void fillBag(TetrisGame *game) {
     int i, j, temp;
     for (i = 0; i < 7; i++) game->bag[i] = i;
-    
-    /* tickを使ったシャッフル (起動直後の固定化対策済み) */
     for (i = 6; i > 0; i--) {
         j = (tick + rand()) % (i + 1); 
         temp = game->bag[i]; game->bag[i] = game->bag[j]; game->bag[j] = temp;
@@ -594,64 +552,64 @@ void fillBag(TetrisGame *game) {
     game->bag_index = 0;
 }
 
-/* ミノのリセット・次生成
- * nextMinoType を現在ミノに昇格させ，新たなNEXTを生成する方式に変更
+/*
+ * [resetMino]
+ * 次のミノをセットし，初期位置に配置する．
  */
 void resetMino(TetrisGame *game) {
     game->minoX = 5;
     game->minoY = 0;
-    
-    /* NEXTを現在ミノに昇格 */
     game->minoType = game->nextMinoType;
-    
-    /* 現在ミノの回転角はランダム */
     game->minoAngle = (tick + rand()) % MINO_ANGLE_MAX;
-
-    /* 次のミノ(NEXT)を補充 */
+    
+    /* Bagが空になったら補充 */
     if (game->bag_index >= 7) fillBag(game);
     game->nextMinoType = game->bag[game->bag_index];
     game->bag_index++;
 }
 
-/* お邪魔ライン(Garbage)のせり上がり処理 */
+/*
+ * [processGarbage]
+ * お邪魔ライン(Garbage)のせり上がり処理．
+ * 戻り値: 1ならゲームオーバー(天井に到達)，0なら成功．
+ */
 int processGarbage(TetrisGame *game) {
     int lines = game->pending_garbage;
     if (lines <= 0) return 0;
-    if (lines > 4) lines = 4;   /* 一度に最大4ラインまで */
+    if (lines > 4) lines = 4; /* 一度の処理上限 */
     game->pending_garbage -= lines;
 
     int i, j, k;
-    /* 最上部にブロックがあるとゲームオーバー */
+    /* 天井判定: せり上がる分だけ上部にブロックがあると死ぬ */
     for (k = 0; k < lines; k++) {
         for (j = 1; j < FIELD_WIDTH - 1; j++) {
             if (game->field[k][j] != 0) return 1; 
         }
     }
-    /* 全体を上にシフト */
+    
+    /* フィールド全体を上にずらす */
     for (i = 0; i < FIELD_HEIGHT - 1 - lines; i++) {
         memcpy(game->field[i], game->field[i + lines], FIELD_WIDTH);
     }
-    /* 最下部に穴あきラインを追加 */
+    
+    /* 下からお邪魔ライン(穴あき)を挿入 */
     for (i = FIELD_HEIGHT - 1 - lines; i < FIELD_HEIGHT - 1; i++) {
-        game->field[i][0] = 1;
-        game->field[i][FIELD_WIDTH - 1] = 1;
+        game->field[i][0] = 1; /* 左壁 */
+        game->field[i][FIELD_WIDTH - 1] = 1; /* 右壁 */
         for (j = 1; j < FIELD_WIDTH - 1; j++) {
             game->field[i][j] = 2 + MINO_TYPE_GARBAGE; 
         }
-        /* ランダムな位置に穴を空ける */
+        /* ランダムな穴を開ける */
         int hole = 1 + (tick + rand() + i) % (FIELD_WIDTH - 2);
         game->field[i][hole] = 0;
     }
     return 0; 
 }
 
-/* -------------------------------------------------------------------
- * 同期・メッセージ表示関数
- * ------------------------------------------------------------------- */
+/* ===========================================================================
+ * 同期・メッセージ表示関連
+ * =========================================================================== */
 
-/* * wait_start: ゲーム開始前の同期と乱数初期化 
- * 修正: 起動直後の乱数固定化を防ぐため，キー入力タイミングでseedを設定
- */
 void wait_start(TetrisGame *game) {
     int opponent_id = (game->port_id == 0) ? 1 : 0;
 
@@ -662,34 +620,29 @@ void wait_start(TetrisGame *game) {
     fprintf(game->fp_out, "\nPress Any Key to Start...\n");
     fflush(game->fp_out);
 
-    /* 1. キー入力待ち (人間が押すまで待機) */
+    /* キー入力待ち */
     while (1) {
         int c = inbyte(game->port_id);
         if (c != -1) break; 
         skipmt();
     }
 
-    /* 2. 乱数初期化: 押された瞬間の tick をシードにする */
     srand((unsigned int)tick);
-
-    /* 3. 開始同期 (相手が準備完了するのを待つ) */
     game->sync_generation++;
+    
     fprintf(game->fp_out, ESC_CLR_LINE);
     fprintf(game->fp_out, "\rWaiting for opponent...   \n");
     fflush(game->fp_out);
 
+    /* 相手との同期待ち */
     while (1) {
         if (all_games[opponent_id] != NULL) {
-            /* 同期世代が一致したら開始 */
             if (all_games[opponent_id]->sync_generation == game->sync_generation) break;
-        } else {
-            break; /* 相手がいなければ待たない */
-        }
+        } else break; /* 相手未接続なら進む仕様 */
         skipmt();
     }
 }
 
-/* リトライ待機処理 */
 void wait_retry(TetrisGame *game) {
     int opponent_id = (game->port_id == 0) ? 1 : 0;
     fprintf(game->fp_out, "\nPress 'R' to Retry...\n");
@@ -701,10 +654,7 @@ void wait_retry(TetrisGame *game) {
         skipmt();
     }
     
-    /* リトライ時も念のため乱数を混ぜる */
     srand((unsigned int)tick + rand());
-
-    /* 同期処理 */
     game->sync_generation++;
     fprintf(game->fp_out, ESC_CLR_LINE);
     fprintf(game->fp_out, "\rWaiting for opponent...   \n");
@@ -738,13 +688,13 @@ void show_victory_message(TetrisGame *game) {
     fflush(game->fp_out);
 }
 
-/* -------------------------------------------------------------------
- * ゲームループ本体
- * ------------------------------------------------------------------- */
+/* ===========================================================================
+ * メインゲームループ
+ * =========================================================================== */
 void run_tetris(TetrisGame *game) {
-    int i, j;
+    int i;
     
-    /* --- ゲーム状態の初期化 --- */
+    /* --- ゲームパラメータ初期化 --- */
     game->score = 0;
     game->lines_cleared = 0;
     game->pending_garbage = 0;
@@ -754,56 +704,55 @@ void run_tetris(TetrisGame *game) {
     
     game->seq_state = 0;
     game->opponent_was_connected = 0;
-    game->prevNextMinoType = -1; /* NEXT描画の強制更新用 */
+    game->prevNextMinoType = -1; 
     
     memset(game->prevBuffer, -1, sizeof(game->prevBuffer));
     memset(game->prevOpponentBuffer, -1, sizeof(game->prevOpponentBuffer));
     
+    /* 画面クリア */
     fprintf(game->fp_out, ESC_CLS ESC_HIDE_CUR); 
     
-    /* フィールド枠の初期化 */
+    /* フィールド初期化 (枠作成) */
     memset(game->field, 0, sizeof(game->field));
     for (i = 0; i < FIELD_HEIGHT; i++) {
-        game->field[i][0] = game->field[i][FIELD_WIDTH - 1] = 1; /* 左右の壁 */
+        game->field[i][0] = game->field[i][FIELD_WIDTH - 1] = 1; 
     }
     for (i = 0; i < FIELD_WIDTH; i++) {
-        game->field[FIELD_HEIGHT - 1][i] = 1; /* 床 */
+        game->field[FIELD_HEIGHT - 1][i] = 1; 
     }
 
-    /* --- 初期ミノセットアップ --- */
-    fillBag(game); /* 最初のバッグ生成 */
-    game->nextMinoType = game->bag[game->bag_index++]; /* 最初のNEXTを準備 */
-    resetMino(game); /* NEXTをCurrentに昇格させ，さらに次のNEXTを準備 */
+    /* 最初のミノ生成 */
+    fillBag(game); 
+    game->nextMinoType = game->bag[game->bag_index++]; 
+    resetMino(game); 
 
+    /* 初期画面描画とカウントダウン */
     display(game);
-
-    /* カウントダウン開始 (ここで 3,2,1... と進む) */
     perform_countdown(game);
 
+    /* ゲーム開始直後のラグ対策: タイマーリセット */
     display(game);
-
     game->next_drop_time = tick + DROP_INTERVAL;
 
     /* --- メインループ --- */
     while (1) {
         Event e = wait_event(game);
 
-        /* ライン消去アニメーション中の処理 */
+        /* アニメーション状態の処理 */
         if (game->state == GS_ANIMATING) {
             if (tick >= game->anim_start_tick + ANIMATION_DURATION) {
-                /* アニメーション終了 */
                 fprintf(game->fp_out, ESC_INVERT_OFF); 
-                
                 game->lines_cleared += game->lines_to_clear;
                 
-                /* 攻撃ライン数の計算 */
+                /* 攻撃(お邪魔ライン)の計算 */
                 int attack = 0;
-                if (game->lines_to_clear == 1) attack = 1;      /* 1列消しは攻撃なし? (ルールによる) */
-                if (game->lines_to_clear == 2) attack = 1;
-                if (game->lines_to_clear == 3) attack = 2;
-                if (game->lines_to_clear == 4) attack = 4;
+                switch(game->lines_to_clear) {
+                    case 1: break;              /* 1列: 0 */
+                    case 2: attack = 1; break;  /* 2列: 1 */
+                    case 3: attack = 2; break;  /* 3列: 2 */
+                    case 4: attack = 4; break;  /* 4列: 4 */
+                }
                 
-                /* 相手へ攻撃を送る */
                 if (attack > 0) {
                     int opponent_id = (game->port_id == 0) ? 1 : 0;
                     if (all_games[opponent_id] != NULL && !all_games[opponent_id]->is_gameover) {
@@ -822,12 +771,13 @@ void run_tetris(TetrisGame *game) {
                 game->state = GS_PLAYING;
                 game->next_drop_time = tick + DROP_INTERVAL; 
                 
+                /* アニメーション終了後にガベージ処理へ移行 */
                 goto PROCESS_GARBAGE;
             }
-            continue; /* アニメーション中は操作を受け付けない */
+            continue; 
         }
 
-        /* 通常イベント処理 */
+        /* 通常プレイ時のイベント処理 */
         switch (e.type) {
             case EVT_WIN:
                 show_victory_message(game);
@@ -840,51 +790,44 @@ void run_tetris(TetrisGame *game) {
                 return;
 
             case EVT_KEY_INPUT:
-                /* 操作処理 */
                 switch (e.param) {
-                    case 's': /* ソフトドロップ */
+                    case 's': /* Down */
                         if (!isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
                             game->minoY++;
                             game->next_drop_time = tick + DROP_INTERVAL;
                         }
                         break;
-                    case 'a': /* 左移動 */
+                    case 'a': /* Left */
                         if (!isHit(game, game->minoX - 1, game->minoY, game->minoType, game->minoAngle)) game->minoX--;
                         break;
-                    case 'd': /* 右移動 */
+                    case 'd': /* Right */
                         if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, game->minoAngle)) game->minoX++;
                         break;
-                    case ' ': /* 回転 */
+                    case ' ': /* Rotate */
                         if (!isHit(game, game->minoX, game->minoY, game->minoType, (game->minoAngle + 1) % MINO_ANGLE_MAX)) {
                             game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
                         }
                         break;
-                    /* ハードドロップ (w または 上矢印) */
-                    case 'w': 
-                        /* 衝突する直前までループで落とす */
+                    case 'w': /* Hard Drop */
                         while (!isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
                             game->minoY++;
-                            game->score += 2; /* ハードドロップボーナス */
+                            game->score += 2; 
                         }
-                        /* 画面更新 (一瞬で下に落ちた様子を描画) */
                         display(game);
-                        
-                        /* そのままロック処理へ強制移行 (EVT_TIMERのロックロジックへジャンプ) */
-                        goto LOCK_PROCESS;
+                        goto LOCK_PROCESS; /* 即座に固定処理へ */
                         break;
                 }
                 display(game);
                 break;
 
             case EVT_TIMER:
-                /* 自由落下処理 */
+                /* 自然落下処理 */
                 if (isHit(game, game->minoX, game->minoY + 1, game->minoType, game->minoAngle)) {
                 
-                /* ロック処理開始地点 (ハードドロップからも飛んでくる) */
-                LOCK_PROCESS:
-                    /* 接地固定 */
+                LOCK_PROCESS: /* ミノ固定処理ラベル */
+                    /* フィールドに固定 */
                     for (i = 0; i < MINO_HEIGHT; i++) {
-                        for (j = 0; j < MINO_WIDTH; j++) {
+                        for (int j = 0; j < MINO_WIDTH; j++) {
                             if (minoShapes[game->minoType][game->minoAngle][i][j]) {
                                 if (game->minoY + i >= 0 && game->minoY + i < FIELD_HEIGHT &&
                                     game->minoX + j >= 0 && game->minoX + j < FIELD_WIDTH) {
@@ -898,11 +841,10 @@ void run_tetris(TetrisGame *game) {
                     int lines_this_turn = 0;
                     for (i = 0; i < FIELD_HEIGHT - 1; i++) {
                         int lineFill = 1;
-                        for (j = 1; j < FIELD_WIDTH - 1; j++) {
+                        for (int j = 1; j < FIELD_WIDTH - 1; j++) {
                             if (game->field[i][j] == 0) { lineFill = 0; break; }
                         }
                         if (lineFill) {
-                            /* ラインを詰める */
                             int k;
                             for (k = i; k > 0; k--) memcpy(game->field[k], game->field[k - 1], FIELD_WIDTH);
                             memset(game->field[0], 0, FIELD_WIDTH);
@@ -918,21 +860,17 @@ void run_tetris(TetrisGame *game) {
                         game->state = GS_ANIMATING;
                         game->anim_start_tick = tick;
                         game->lines_to_clear = lines_this_turn;
-                        break; /* タイマーイベント処理中断してループ先頭へ */
+                        break; /* イベントループに戻りアニメーション待機 */
                     }
 
-                PROCESS_GARBAGE:
-                    /* お邪魔ラインの処理 */
+                PROCESS_GARBAGE: /* お邪魔処理ラベル */
                     if (processGarbage(game)) {
-                        /* せり上がりで窒息 */
                         game->is_gameover = 1;
                         fprintf(game->fp_out, "\a");
                         show_gameover_message(game);
                         wait_retry(game); 
                         return;
                     }
-                    
-                    /* 次のミノへ */
                     resetMino(game);
                     
                     /* 出現即死亡判定 */
@@ -946,73 +884,55 @@ void run_tetris(TetrisGame *game) {
                     game->next_drop_time = tick + DROP_INTERVAL;
 
                 } else {
-                    /* まだ落ちる余地あり */
+                    /* 接地していなければ1段下げる */
                     game->minoY++;
                     game->next_drop_time = tick + DROP_INTERVAL;
                 }
                 display(game);
                 break;
-                
             default:
                 break;
         }
     }
 }
 
-/* -------------------------------------------------------------------
- * ユーザタスク定義
- * ------------------------------------------------------------------- */
+/* ===========================================================================
+ * タスクエントリポイント
+ * =========================================================================== */
 
-/* タスク1: Port 0 (UART1) 担当 */
 void task1(void) {
     TetrisGame game1;
     game1.port_id = 0;
     game1.fp_out = com0out;
     game1.sync_generation = 0;
     all_games[0] = &game1; 
-    
-    /* 初期化同期 */
     wait_start(&game1);
-
-    while(1) {
-        run_tetris(&game1);
-    }
+    while(1) { run_tetris(&game1); }
 }
 
-/* タスク2: Port 1 (UART2) 担当 */
 void task2(void) {
     TetrisGame game2;
     game2.port_id = 1;
     game2.fp_out = com1out;
     game2.sync_generation = 0;
     all_games[1] = &game2;
-    
-    /* 初期化同期 */
     wait_start(&game2);
-
-    while(1) {
-        run_tetris(&game2);
-    }
+    while(1) { run_tetris(&game2); }
 }
 
-/* -------------------------------------------------------------------
- * メイン関数
- * ------------------------------------------------------------------- */
+/* ===========================================================================
+ * main関数
+ * =========================================================================== */
 int main(void) {
-    /* カーネル初期化 */
     init_kernel();
-    
-    /* シリアルポートのストリーム設定 (Port0, Port1) */
     com0in  = fdopen(0, "r");
     com0out = fdopen(1, "w");
     com1in  = fdopen(4, "r");
     com1out = fdopen(4, "w");
-
-    /* タスクの登録 */
+    
     set_task(task1);
     set_task(task2);
-
-    /* マルチタスクスケジューリング開始 (ここからは戻らない) */
+    
     begin_sch();
     return 0;
 }
