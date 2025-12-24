@@ -943,9 +943,37 @@ void run_tetris(TetrisGame *game) {
                     case 'd': /* Right */
                         if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, game->minoAngle)) game->minoX++;
                         break;
-                    case ' ': /* Rotate */
-                        if (!isHit(game, game->minoX, game->minoY, game->minoType, (game->minoAngle + 1) % MINO_ANGLE_MAX)) {
-                            game->minoAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
+                    case ' ': /* Rotate with Wall Kick (簡易スーパーローテーション) */
+                        {
+                            int newAngle = (game->minoAngle + 1) % MINO_ANGLE_MAX;
+                            
+                            /* 優先順位1: 通常回転 (その場で回れるならそのまま) */
+                            if (!isHit(game, game->minoX, game->minoY, game->minoType, newAngle)) {
+                                game->minoAngle = newAngle;
+                            }
+                            /* 優先順位2: 右に1ズレて回転 (左壁際対策) */
+                            else if (!isHit(game, game->minoX + 1, game->minoY, game->minoType, newAngle)) {
+                                game->minoX++;
+                                game->minoAngle = newAngle;
+                            }
+                            /* 優先順位3: 左に1ズレて回転 (右壁際対策) */
+                            else if (!isHit(game, game->minoX - 1, game->minoY, game->minoType, newAngle)) {
+                                game->minoX--;
+                                game->minoAngle = newAngle;
+                            }
+                            /* 優先順位4: I型用 右に2ズレ (I型は長いため1マスでは足りない場合がある) */
+                            else if (game->minoType == MINO_TYPE_I && 
+                                     !isHit(game, game->minoX + 2, game->minoY, game->minoType, newAngle)) {
+                                game->minoX += 2;
+                                game->minoAngle = newAngle;
+                            }
+                            /* 優先順位5: I型用 左に2ズレ */
+                            else if (game->minoType == MINO_TYPE_I && 
+                                     !isHit(game, game->minoX - 2, game->minoY, game->minoType, newAngle)) {
+                                game->minoX -= 2;
+                                game->minoAngle = newAngle;
+                            }
+                            /* どのパターンでも回れなければ回転しない */
                         }
                         break;
                     case 'w': /* Hard Drop */
