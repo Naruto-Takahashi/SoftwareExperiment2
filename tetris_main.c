@@ -75,7 +75,7 @@ extern SEMAPHORE_TYPE semaphore[NUMSEMAPHORE];  /* セマフォ管理配列 */
 /* --- ゲームバランス調整 --- */
 #define DROP_INTERVAL      500  /* 自然落下の間隔 (tick単位) */
 #define ANIMATION_DURATION 3    /* ライン消去演出の時間 (tick単位) */
-#define COUNTDOWN_DELAY    1000 /* 開始カウントダウンの待ち時間 (tick単位) */
+#define COUNTDOWN_DELAY    10000 /* 開始カウントダウンの待ち時間 (tick単位) */
 
 /* --- システム挙動設定 --- */
 #define DISPLAY_POLL_INTERVAL 50 /* 描画更新処理の間引き間隔 (CPU負荷軽減) */
